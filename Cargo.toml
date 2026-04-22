@@ -1,0 +1,17 @@
+[package]
+name = "wgls-rs-fft"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "wgls_rs_fft"
+path = "src/lib.rs"
+
+[dependencies]
+wgpu = "29"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+num-complex = "0.4"
+
+[dev-dependencies]
+rustfft = "6"
