@@ -131,7 +131,7 @@ impl GpuFft {
     /// use wgls_rs_fft::GpuFft;
     /// use num_complex::Complex;
     ///
-    /// let fft = GpuFft::new().expect("GPU required");
+    /// let fft = GpuFft::new().expect("GPU or CPU fallback required");
     /// let input = vec![Complex::new(1.0, 0.0); 1024];
     /// let spectrum = fft.fft(&input).expect("FFT failed");
     /// ```
@@ -139,17 +139,66 @@ impl GpuFft {
         &self,
         input: &[Complex<f32>],
     ) -> Result<Vec<Complex<f32>>, Box<dyn std::error::Error>> {
+        self.transform_internal(input, false)
+    }
+
+    /// Compute the inverse FFT of `input`.
+    ///
+    /// Returns a `Vec` of `N` complex time-domain samples where `N = input.len()`.
+    /// The output is automatically scaled by `1/N` to maintain the unitary transform property.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `input` is empty or its length is not a power of two.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a GPU operation fails (buffer mapping, device lost, etc.).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wgls_rs_fft::GpuFft;
+    /// use num_complex::Complex;
+    ///
+    /// let fft = GpuFft::new().expect("GPU or CPU fallback required");
+    /// let spectrum = vec![Complex::new(1.0, 0.0); 1024];
+    /// let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
+    /// // reconstructed ≈ original signal (within numerical precision)
+    /// ```
+    pub fn ifft(
+        &self,
+        input: &[Complex<f32>],
+    ) -> Result<Vec<Complex<f32>>, Box<dyn std::error::Error>> {
+        self.transform_internal(input, true)
+    }
+
+    /// Internal transform implementation that handles both FFT and IFFT.
+    ///
+    /// When `inverse` is true, computes IFFT (with conjugation and 1/N scaling).
+    /// When `inverse` is false, computes standard FFT.
+    fn transform_internal(
+        &self,
+        input: &[Complex<f32>],
+        inverse: bool,
+    ) -> Result<Vec<Complex<f32>>, Box<dyn std::error::Error>> {
         let n = input.len();
         assert!(
             n.is_power_of_two() && n > 0,
-            "FFT length must be a non-zero power of two"
+            "Transform length must be a non-zero power of two"
         );
 
         let log_n = n.trailing_zeros();
         let sc = self.get_or_build_size_cache(n, log_n);
 
+        // For IFFT: conjugate input
+        let raw: Vec<f32> = if inverse {
+            input.iter().flat_map(|c| [c.re, -c.im]).collect()
+        } else {
+            input.iter().flat_map(|c| [c.re, c.im]).collect()
+        };
+
         // Upload input to buf_a (always the starting buffer).
-        let raw: Vec<f32> = input.iter().flat_map(|c| [c.re, c.im]).collect();
         self.queue
             .write_buffer(&sc.buf_a, 0, bytemuck::cast_slice(&raw));
 
@@ -177,74 +226,26 @@ impl GpuFft {
 
         let mapped = slice.get_mapped_range();
         let floats: &[f32] = bytemuck::cast_slice(&mapped);
-        let output: Vec<Complex<f32>> = floats
+        let mut output: Vec<Complex<f32>> = floats
             .chunks_exact(2)
             .map(|p| Complex { re: p[0], im: p[1] })
             .collect();
+
+        // For IFFT: conjugate output and scale by 1/N
+        if inverse {
+            let scale = 1.0 / n as f32;
+            for c in &mut output {
+                *c = Complex {
+                    re: c.re * scale,
+                    im: -c.im * scale,
+                };
+            }
+        }
 
         drop(mapped);
         sc.staging_buf.unmap();
 
         Ok(output)
-    }
-
-    /// Compute the inverse FFT of `input`.
-    ///
-    /// Returns a `Vec` of `N` complex time-domain samples where `N = input.len()`.
-    /// The output is automatically scaled by `1/N` to maintain the unitary transform property.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `input` is empty or its length is not a power of two.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a GPU operation fails (buffer mapping, device lost, etc.).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use wgls_rs_fft::GpuFft;
-    /// use num_complex::Complex;
-    ///
-    /// let fft = GpuFft::new().expect("GPU required");
-    /// let spectrum = vec![Complex::new(1.0, 0.0); 1024];
-    /// let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
-    /// // reconstructed ≈ original signal (within numerical precision)
-    /// ```
-    pub fn ifft(
-        &self,
-        input: &[Complex<f32>],
-    ) -> Result<Vec<Complex<f32>>, Box<dyn std::error::Error>> {
-        let n = input.len();
-        assert!(
-            n.is_power_of_two() && n > 0,
-            "IFFT length must be a non-zero power of two"
-        );
-
-        // IFFT = FFT with conjugated input and conjugated output, then scale by 1/N
-        // Conjugate input
-        let conjugated: Vec<Complex<f32>> = input
-            .iter()
-            .map(|c| Complex {
-                re: c.re,
-                im: -c.im,
-            })
-            .collect();
-
-        // Compute FFT of conjugated input
-        let mut result = self.fft(&conjugated)?;
-
-        // Conjugate output and scale by 1/N
-        let scale = 1.0 / n as f32;
-        for c in &mut result {
-            *c = Complex {
-                re: c.re * scale,
-                im: -c.im * scale,
-            };
-        }
-
-        Ok(result)
     }
 
     /// Get or build size-specific GPU resources.
