@@ -30,6 +30,7 @@ struct SizeCache {
     buf_a: wgpu::Buffer,
     buf_b: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
+    #[allow(dead_code)] // Used in shader but not directly accessed in Rust code
     twiddle_buf: wgpu::Buffer,
     data_bytes: u64,
     stage_bgs: Vec<wgpu::BindGroup>,
@@ -377,7 +378,7 @@ impl GpuFft {
             data_bytes,
             stage_bgs,
             result_in_b: log_n % 2 == 1,
-            wg_n2: ((n as u32 / 2) + 255) / 256,
+            wg_n2: (n as u32 / 2).div_ceil(256),
         }
     }
 }
