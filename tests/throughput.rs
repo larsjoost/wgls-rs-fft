@@ -71,7 +71,7 @@ fn bench(fft: &GpuFft, n: usize, min_iters: usize, min_duration: Duration) -> Be
 /// - **ms/call**    — wall-clock time per single FFT call
 #[test]
 fn fft_throughput() {
-    let fft = GpuFft::new();
+    let fft = GpuFft::new().expect("GPU required");
 
     // (size, min_iters, min_duration_ms)
     // Larger sizes need fewer iterations to reach the time budget.

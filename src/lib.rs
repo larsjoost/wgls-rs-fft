@@ -37,7 +37,7 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
 use num_complex::Complex;
-use wgsl_rs::std::*;
+
 
 /// Uniforms passed to the compute shader (16-byte aligned).
 #[repr(C)]
@@ -75,44 +75,27 @@ struct GpuBackend {
     cache: Mutex<HashMap<usize, Arc<SizeCache>>>,
 }
 
-enum Backend {
-    Gpu(GpuBackend),
-    /// CPU fallback: the wgsl-rs module statics are global, so concurrent
-    /// CPU FFT calls must be serialized.
-    Cpu(Mutex<()>),
-}
-
-/// FFT executor that uses a GPU if one is available, or falls back to CPU.
+/// GPU-accelerated FFT executor.
 ///
-/// Create with [`GpuFft::new`] — it never fails.
-/// Check which backend is active with [`GpuFft::is_gpu_backed`].
+/// Create with [`GpuFft::new`] which returns `Result`.
+/// Check if GPU is available with [`GpuFft::is_gpu_available`].
 pub struct GpuFft {
-    backend: Backend,
+    backend: GpuBackend,
 }
 
 impl GpuFft {
     /// Create a new [`GpuFft`].
     ///
     /// Attempts to acquire a high-performance GPU adapter via wgpu.
-    /// If no compatible GPU is found, transparently falls back to the
-    /// wgsl-rs CPU runtime running the same shader code.
-    pub fn new() -> Self {
-        // Initialize CPU runtime early in case we need to fall back
-        ensure_cpu_runtime_initialized();
-
-        match pollster::block_on(GpuBackend::try_new()) {
-            Ok(gpu) => Self {
-                backend: Backend::Gpu(gpu),
-            },
-            Err(_) => Self {
-                backend: Backend::Cpu(Mutex::new(())),
-            },
-        }
+    /// Returns `Err` if no compatible GPU is available.
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let gpu = pollster::block_on(GpuBackend::try_new())?;
+        Ok(Self { backend: gpu })
     }
 
-    /// Returns `true` if this instance is backed by a real GPU.
-    pub fn is_gpu_backed(&self) -> bool {
-        matches!(self.backend, Backend::Gpu(_))
+    /// Check if a GPU is available without creating an instance.
+    pub fn is_gpu_available() -> bool {
+        pollster::block_on(GpuBackend::try_new()).is_ok()
     }
 
     /// Compute the forward FFT of `input`.
@@ -126,8 +109,7 @@ impl GpuFft {
     ///
     /// # Errors
     ///
-    /// On the GPU path, returns an error if a GPU operation fails (buffer
-    /// mapping, device lost, etc.). The CPU path never errors.
+    /// Returns an error if a GPU operation fails (buffer mapping, device lost, etc.).
     pub fn fft(
         &self,
         input: &[Complex<f32>],
@@ -138,13 +120,7 @@ impl GpuFft {
             "FFT length must be a non-zero power of two"
         );
 
-        match &self.backend {
-            Backend::Gpu(gpu) => gpu.fft(input),
-            Backend::Cpu(lock) => {
-                let _guard = lock.lock().unwrap();
-                Ok(cpu_fft(input))
-            }
-        }
+        self.backend.fft(input)
     }
 
     /// Compute the inverse FFT of `input`.
@@ -172,42 +148,34 @@ impl GpuFft {
         );
 
         // IFFT = FFT with conjugated input and conjugated output, then scale by 1/N
-        match &self.backend {
-            Backend::Gpu(gpu) => {
-                // Conjugate input
-                let conjugated: Vec<Complex<f32>> = input
-                    .iter()
-                    .map(|c| Complex {
-                        re: c.re,
-                        im: -c.im,
-                    })
-                    .collect();
+        // Conjugate input
+        let conjugated: Vec<Complex<f32>> = input
+            .iter()
+            .map(|c| Complex {
+                re: c.re,
+                im: -c.im,
+            })
+            .collect();
 
-                // Compute FFT of conjugated input
-                let mut result = gpu.fft(&conjugated)?;
+        // Compute FFT of conjugated input
+        let mut result = self.backend.fft(&conjugated)?;
 
-                // Conjugate output and scale by 1/N
-                let scale = 1.0 / n as f32;
-                for c in &mut result {
-                    *c = Complex {
-                        re: c.re * scale,
-                        im: -c.im * scale,
-                    };
-                }
-
-                Ok(result)
-            }
-            Backend::Cpu(lock) => {
-                let _guard = lock.lock().unwrap();
-                Ok(cpu_ifft(input))
-            }
+        // Conjugate output and scale by 1/N
+        let scale = 1.0 / n as f32;
+        for c in &mut result {
+            *c = Complex {
+                re: c.re * scale,
+                im: -c.im * scale,
+            };
         }
+
+        Ok(result)
     }
 }
 
 impl Default for GpuFft {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("No GPU available for default GpuFft instance")
     }
 }
 
@@ -444,93 +412,5 @@ impl GpuBackend {
 }
 
 // ---------------------------------------------------------------------------
-// CPU fallback — runs the same Stockham kernel via the wgsl-rs CPU runtime.
+// Removed CPU fallback - this is now a GPU-only library
 // ---------------------------------------------------------------------------
-
-/// Initialize the wgsl-rs CPU runtime if not already initialized
-fn ensure_cpu_runtime_initialized() {
-    // This ensures the wgsl-rs module statics are properly initialized
-    // by accessing them at least once before use
-    use wgsl_rs::std::*;
-
-    // Trigger initialization by accessing module variables
-    let _ = RuntimeArray::<f32>::with_capacity(0);
-    let _ = vec4u(0, 0, 0, 0);
-}
-
-fn cpu_fft(input: &[Complex<f32>]) -> Vec<Complex<f32>> {
-    // Ensure runtime is initialized
-    ensure_cpu_runtime_initialized();
-    let n = input.len();
-    let log_n = n.trailing_zeros();
-
-    // Pack input into RuntimeArray (the wgsl-rs CPU buffer type).
-    let mut a = RuntimeArray::with_capacity(n * 2);
-    for c in input {
-        a.push(c.re);
-        a.push(c.im);
-    }
-    let mut b = RuntimeArray::with_capacity(n * 2);
-    for _ in 0..n * 2 {
-        b.push(0.0_f32);
-    }
-
-    // Each stage: set SRC=a, DST=b, dispatch, then swap:
-    // a ← DST output, b ← old SRC (will be overwritten next stage).
-    for stage in 0..log_n {
-        shaders::stockham::U.set(vec4u(n as u32, stage, log_n, 0));
-        shaders::stockham::SRC.set(a);
-        shaders::stockham::DST.set(b);
-        dispatch_workgroups(((n as u32 / 2).div_ceil(64), 1, 1), (64, 1, 1), |inv| {
-            shaders::stockham::main(inv.global_invocation_id)
-        });
-        a = shaders::stockham::DST.get().clone();
-        b = shaders::stockham::SRC.get().clone();
-    }
-
-    a.data
-        .chunks_exact(2)
-        .map(|p| Complex { re: p[0], im: p[1] })
-        .collect()
-}
-
-fn cpu_ifft(input: &[Complex<f32>]) -> Vec<Complex<f32>> {
-    // Ensure runtime is initialized
-    ensure_cpu_runtime_initialized();
-
-    let n = input.len();
-    let log_n = n.trailing_zeros();
-
-    // Conjugate input for IFFT
-    let mut a = RuntimeArray::with_capacity(n * 2);
-    for c in input {
-        a.push(c.re); // real part
-        a.push(-c.im); // negated imaginary part
-    }
-    let mut b = RuntimeArray::with_capacity(n * 2);
-    for _ in 0..n * 2 {
-        b.push(0.0_f32);
-    }
-
-    // Each stage: set SRC=a, DST=b, dispatch, then swap:
-    for stage in 0..log_n {
-        shaders::stockham::U.set(vec4u(n as u32, stage, log_n, 0));
-        shaders::stockham::SRC.set(a);
-        shaders::stockham::DST.set(b);
-        dispatch_workgroups(((n as u32 / 2).div_ceil(64), 1, 1), (64, 1, 1), |inv| {
-            shaders::stockham::main(inv.global_invocation_id)
-        });
-        a = shaders::stockham::DST.get().clone();
-        b = shaders::stockham::SRC.get().clone();
-    }
-
-    // Conjugate output and scale by 1/N
-    let scale = 1.0 / n as f32;
-    a.data
-        .chunks_exact(2)
-        .map(|p| Complex {
-            re: p[0] * scale,
-            im: -p[1] * scale,
-        })
-        .collect()
-}

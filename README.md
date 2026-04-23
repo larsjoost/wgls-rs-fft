@@ -7,6 +7,9 @@ where each stage reads from one buffer and writes to the other. This eliminates 
 bit-reversal pass and removes all inter-stage memory hazards, allowing the entire transform
 to run in a single GPU compute pass with one `queue.submit()` call.
 
+**GPU-only**: This library requires a wgpu-compatible GPU (Vulkan, Metal, DX12, or WebGPU).
+If no GPU is available, `GpuFft::new()` will return an error.
+
 The WGSL compute kernels were authored with [wgsl-rs](https://github.com/schell/wgsl-rs) —
 a crate that lets you write type-safe, Rust-like WGSL shaders that are validated at compile time.
 
@@ -24,13 +27,14 @@ num-complex  = "0.4"
 use wgls_rs_fft::GpuFft;
 use num_complex::Complex;
 
-let fft = GpuFft::new().expect("no GPU available");
+// Create FFT instance - returns Result since GPU might not be available
+let fft = GpuFft::new()?;
 
 let input: Vec<Complex<f32>> = (0..1024)
     .map(|i| Complex { re: (i as f32 * 0.1).sin(), im: 0.0 })
     .collect();
 
-let spectrum = fft.fft(&input).expect("FFT failed");
+let spectrum = fft.fft(&input)?;
 assert_eq!(spectrum.len(), 1024);
 ```
 
