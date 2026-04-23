@@ -1,0 +1,40 @@
+# GitHub Actions Ubuntu runner image
+FROM ubuntu:22.04
+
+# Install basic dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    build-essential \
+    cmake \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install wgpu dependencies
+RUN apt-get update && apt-get install -y \
+    libx11-dev \
+    libasound2-dev \
+    libudev-dev \
+    libwayland-dev \
+    libxkbcommon-dev
+
+# Set up environment
+ENV CARGO_TERM_COLOR=always
+WORKDIR /workspace
+
+# Copy source code
+COPY . .
+
+# Build and test (same as GitHub CI)
+RUN cargo build --verbose && \
+    cargo test --verbose && \
+    cargo fmt --check && \
+    cargo clippy -- -D warnings
+
+CMD ["cargo", "test", "--verbose"]
