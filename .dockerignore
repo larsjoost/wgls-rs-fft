@@ -1,0 +1,26 @@
+# Docker ignore file to speed up builds
+
+# Build artifacts
+target/
+
+# Git directory
+.git/
+
+# IDE/editor files
+.claude/
+.idea/
+.vscode/
+*.swp
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Documentation cache
+DOCKER_CI_SETUP.md
+
+# Environment files
+.env
+
+# Cargo cache
+# Cargo.lock

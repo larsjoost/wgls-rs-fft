@@ -1,7 +1,7 @@
 # Dockerfile for CI testing of wgls-rs-fft
 # This provides a consistent environment for both local and GitHub CI testing
 
-FROM rust:latest
+FROM docker.io/library/rust:latest
 
 # Install system dependencies required for wgpu/GPU testing
 RUN apt-get update && apt-get install -y \
@@ -13,6 +13,11 @@ RUN apt-get update && apt-get install -y \
     libxkbcommon-dev \
     git \
     ca-certificates \
+    # Vulkan and Mesa for software rendering
+    vulkan-tools \
+    libvulkan-dev \
+    mesa-vulkan-drivers \
+    libgl1-mesa-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install additional tools
@@ -21,12 +26,20 @@ RUN rustup component add clippy rustfmt
 # Set up working directory
 WORKDIR /workspace
 
-# Copy the repository contents
-COPY . .
+# Copy only essential files first for better caching
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY tests/ ./tests/
 
-# Set environment variables for better error reporting
+# Set environment variables for better error reporting and GPU software rendering
 ENV RUST_BACKTRACE=1
 ENV CARGO_TERM_COLOR=always
+ENV WGPU_BACKEND=vulkan
+ENV VULKAN_SDK=/usr/lib/x86_64-linux-gnu
 
 # Make CI script executable
 RUN chmod +x scripts/ci_test.sh
+
+# Copy remaining files
+COPY . .
