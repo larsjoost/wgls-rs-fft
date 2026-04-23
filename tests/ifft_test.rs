@@ -1,0 +1,114 @@
+use num_complex::Complex;
+use rustfft::FftPlanner;
+use wgls_rs_fft::GpuFft;
+
+const N: usize = 1024;
+const EPSILON: f32 = 1e-3;
+
+fn make_test_signal(n: usize) -> Vec<Complex<f32>> {
+    (0..n)
+        .map(|i| Complex {
+            re: (i as f32 * 0.1).sin(),
+            im: (i as f32 * 0.07).cos(),
+        })
+        .collect()
+}
+
+#[test]
+fn test_ifft_roundtrip() {
+    let fft = GpuFft::new();
+    let original = make_test_signal(N);
+
+    // Forward FFT
+    let spectrum = fft.fft(&original).expect("FFT failed");
+    assert_eq!(spectrum.len(), N);
+
+    // Inverse FFT
+    let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
+    assert_eq!(reconstructed.len(), N);
+
+    // Check roundtrip accuracy
+    let mut max_diff: f32 = 0.0;
+    for (i, (orig, recon)) in original.iter().zip(reconstructed.iter()).enumerate() {
+        let diff = ((orig.re - recon.re).powi(2) + (orig.im - recon.im).powi(2)).sqrt();
+        max_diff = max_diff.max(diff);
+        assert!(
+            diff < EPSILON,
+            "element {i}: original={orig:?}  reconstructed={recon:?}  diff={diff:.2e}"
+        );
+    }
+    println!("IFFT roundtrip max element-wise error: {max_diff:.2e}");
+}
+
+#[test]
+fn test_ifft_matches_rustfft() {
+    let fft = GpuFft::new();
+
+    // Create a time-domain signal and compute its FFT first
+    let time_domain = make_test_signal(N);
+    let frequency_domain = fft.fft(&time_domain).expect("FFT failed");
+
+    // Compute IFFT with our implementation
+    let our_ifft = fft.ifft(&frequency_domain).expect("IFFT failed");
+
+    // Compute forward FFT with rustfft for comparison (since our IFFT should reconstruct original)
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(N);
+    let mut rustfft_freq = time_domain.clone();
+    fft.process(&mut rustfft_freq);
+
+    let ifft = planner.plan_fft_inverse(N);
+    let mut rustfft_time = rustfft_freq.clone();
+    ifft.process(&mut rustfft_time);
+
+    // Scale rustfft result by 1/N to match our unitary transform
+    let scale = 1.0 / N as f32;
+    for c in &mut rustfft_time {
+        *c = Complex {
+            re: c.re * scale,
+            im: c.im * scale,
+        };
+    }
+
+    // Compare our IFFT result with rustfft's roundtrip
+    assert_eq!(our_ifft.len(), N);
+    let mut max_diff: f32 = 0.0;
+    for (_i, (ours, rustfft)) in our_ifft.iter().zip(rustfft_time.iter()).enumerate() {
+        let diff = ((ours.re - rustfft.re).powi(2) + (ours.im - rustfft.im).powi(2)).sqrt();
+        max_diff = max_diff.max(diff);
+        assert!(
+            diff < EPSILON,
+            "ours={ours:?}  rustfft={rustfft:?}  diff={diff:.2e}"
+        );
+    }
+    println!("IFFT vs rustfft roundtrip max element-wise error: {max_diff:.2e}");
+}
+
+#[test]
+fn test_fft_ifft_properties() {
+    let fft = GpuFft::new();
+    let input = make_test_signal(N);
+
+    // FFT then IFFT should return scaled original
+    let spectrum = fft.fft(&input).expect("FFT failed");
+    let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
+
+    // Check that FFT(IFFT(x)) = x and IFFT(FFT(x)) = x (within numerical precision)
+    let mut max_diff: f32 = 0.0;
+    for (i, (orig, recon)) in input.iter().zip(reconstructed.iter()).enumerate() {
+        let diff = ((orig.re - recon.re).powi(2) + (orig.im - recon.im).powi(2)).sqrt();
+        max_diff = max_diff.max(diff);
+    }
+    println!("FFT->IFFT roundtrip max error: {max_diff:.2e}");
+    assert!(max_diff < EPSILON);
+
+    // Test that IFFT(FFT(x)) = x
+    let spectrum2 = fft.fft(&reconstructed).expect("FFT failed");
+    let mut max_diff2: f32 = 0.0;
+    for (i, (s1, s2)) in spectrum.iter().zip(spectrum2.iter()).enumerate() {
+        let diff = ((s1.re - s2.re).powi(2) + (s1.im - s2.im).powi(2)).sqrt();
+        max_diff2 = max_diff2.max(diff);
+    }
+    println!("IFFT->FFT roundtrip max error: {max_diff2:.2e}");
+    assert!(max_diff2 < EPSILON);
+}

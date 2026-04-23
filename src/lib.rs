@@ -143,6 +143,63 @@ impl GpuFft {
             }
         }
     }
+
+    /// Compute the inverse FFT of `input`.
+    ///
+    /// Returns a `Vec` of `N` complex time-domain samples where `N =
+    /// input.len()`. The output is automatically scaled by `1/N` to
+    /// maintain the unitary transform property.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `input` is empty or its length is not a power of two.
+    ///
+    /// # Errors
+    ///
+    /// On the GPU path, returns an error if a GPU operation fails (buffer
+    /// mapping, device lost, etc.). The CPU path never errors.
+    pub fn ifft(
+        &self,
+        input: &[Complex<f32>],
+    ) -> Result<Vec<Complex<f32>>, Box<dyn std::error::Error>> {
+        let n = input.len();
+        assert!(
+            n.is_power_of_two() && n > 0,
+            "IFFT length must be a non-zero power of two"
+        );
+
+        // IFFT = FFT with conjugated input and conjugated output, then scale by 1/N
+        match &self.backend {
+            Backend::Gpu(gpu) => {
+                // Conjugate input
+                let conjugated: Vec<Complex<f32>> = input
+                    .iter()
+                    .map(|c| Complex {
+                        re: c.re,
+                        im: -c.im,
+                    })
+                    .collect();
+
+                // Compute FFT of conjugated input
+                let mut result = gpu.fft(&conjugated)?;
+
+                // Conjugate output and scale by 1/N
+                let scale = 1.0 / n as f32;
+                for c in &mut result {
+                    *c = Complex {
+                        re: c.re * scale,
+                        im: -c.im * scale,
+                    };
+                }
+
+                Ok(result)
+            }
+            Backend::Cpu(lock) => {
+                let _guard = lock.lock().unwrap();
+                Ok(cpu_ifft(input))
+            }
+        }
+    }
 }
 
 impl Default for GpuFft {
@@ -418,5 +475,43 @@ fn cpu_fft(input: &[Complex<f32>]) -> Vec<Complex<f32>> {
     a.data
         .chunks_exact(2)
         .map(|p| Complex { re: p[0], im: p[1] })
+        .collect()
+}
+
+fn cpu_ifft(input: &[Complex<f32>]) -> Vec<Complex<f32>> {
+    let n = input.len();
+    let log_n = n.trailing_zeros();
+
+    // Conjugate input for IFFT
+    let mut a = RuntimeArray::with_capacity(n * 2);
+    for c in input {
+        a.push(c.re); // real part
+        a.push(-c.im); // negated imaginary part
+    }
+    let mut b = RuntimeArray::with_capacity(n * 2);
+    for _ in 0..n * 2 {
+        b.push(0.0_f32);
+    }
+
+    // Each stage: set SRC=a, DST=b, dispatch, then swap:
+    for stage in 0..log_n {
+        shaders::stockham::U.set(vec4u(n as u32, stage, log_n, 0));
+        shaders::stockham::SRC.set(a);
+        shaders::stockham::DST.set(b);
+        dispatch_workgroups(((n as u32 / 2).div_ceil(64), 1, 1), (64, 1, 1), |inv| {
+            shaders::stockham::main(inv.global_invocation_id)
+        });
+        a = shaders::stockham::DST.get().clone();
+        b = shaders::stockham::SRC.get().clone();
+    }
+
+    // Conjugate output and scale by 1/N
+    let scale = 1.0 / n as f32;
+    a.data
+        .chunks_exact(2)
+        .map(|p| Complex {
+            re: p[0] * scale,
+            im: -p[1] * scale,
+        })
         .collect()
 }

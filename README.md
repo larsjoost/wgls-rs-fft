@@ -18,6 +18,8 @@ wgls-rs-fft = "0.1"
 num-complex  = "0.4"
 ```
 
+### Forward FFT
+
 ```rust
 use wgls_rs_fft::GpuFft;
 use num_complex::Complex;
@@ -30,6 +32,20 @@ let input: Vec<Complex<f32>> = (0..1024)
 
 let spectrum = fft.fft(&input).expect("FFT failed");
 assert_eq!(spectrum.len(), 1024);
+```
+
+### Inverse FFT
+
+```rust
+// Compute inverse FFT (automatically scaled by 1/N)
+let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
+assert_eq!(reconstructed.len(), 1024);
+
+// Roundtrip: FFT(IFFT(x)) ≈ x (within numerical precision)
+let roundtrip_error = original.iter().zip(reconstructed.iter())
+    .map(|(a, b)| ((a.re - b.re).powi(2) + (a.im - b.im).powi(2)).sqrt())
+    .fold(0.0, f32::max);
+println!("Max roundtrip error: {roundtrip_error:.2e}");
 ```
 
 ## Requirements
@@ -61,7 +77,6 @@ Accuracy: max element-wise L₂ error vs. `rustfft` is below **1e-3** for N = 10
 
 ## Limitations
 
-- Forward (analysis) FFT only; inverse FFT is not yet implemented.
 - Single-precision (`f32`) only.
 
 ## Shader development
