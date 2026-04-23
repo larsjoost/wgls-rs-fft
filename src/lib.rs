@@ -128,9 +128,9 @@ impl GpuFft {
     /// use wgls_rs_fft::GpuFft;
     /// use num_complex::Complex;
     ///
-    /// let fft = GpuFft::new()?;
+    /// let fft = GpuFft::new().expect("GPU required");
     /// let input = vec![Complex::new(1.0, 0.0); 1024];
-    /// let spectrum = fft.fft(&input)?;
+    /// let spectrum = fft.fft(&input).expect("FFT failed");
     /// ```
     pub fn fft(
         &self,
@@ -203,9 +203,9 @@ impl GpuFft {
     /// use wgls_rs_fft::GpuFft;
     /// use num_complex::Complex;
     ///
-    /// let fft = GpuFft::new()?;
+    /// let fft = GpuFft::new().expect("GPU required");
     /// let spectrum = vec![Complex::new(1.0, 0.0); 1024];
-    /// let reconstructed = fft.ifft(&spectrum)?;
+    /// let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
     /// // reconstructed ≈ original signal (within numerical precision)
     /// ```
     pub fn ifft(
