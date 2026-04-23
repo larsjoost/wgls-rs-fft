@@ -23,3 +23,8 @@ wgsl-rs = { git = "https://github.com/schell/wgsl-rs", rev = "07175c49dfc231f309
 
 [dev-dependencies]
 rustfft = "6"
+criterion = "0.5"
+
+[[bench]]
+name = "fft_benchmark"
+harness = false
