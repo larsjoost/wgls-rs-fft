@@ -95,7 +95,7 @@ fn test_fft_ifft_properties() {
 
     // Check that FFT(IFFT(x)) = x and IFFT(FFT(x)) = x (within numerical precision)
     let mut max_diff: f32 = 0.0;
-    for (i, (orig, recon)) in input.iter().zip(reconstructed.iter()).enumerate() {
+    for (orig, recon) in input.iter().zip(reconstructed.iter()) {
         let diff = ((orig.re - recon.re).powi(2) + (orig.im - recon.im).powi(2)).sqrt();
         max_diff = max_diff.max(diff);
     }
@@ -105,7 +105,7 @@ fn test_fft_ifft_properties() {
     // Test that IFFT(FFT(x)) = x
     let spectrum2 = fft.fft(&reconstructed).expect("FFT failed");
     let mut max_diff2: f32 = 0.0;
-    for (i, (s1, s2)) in spectrum.iter().zip(spectrum2.iter()).enumerate() {
+    for (s1, s2) in spectrum.iter().zip(spectrum2.iter()) {
         let diff = ((s1.re - s2.re).powi(2) + (s1.im - s2.im).powi(2)).sqrt();
         max_diff2 = max_diff2.max(diff);
     }

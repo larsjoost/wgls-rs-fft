@@ -38,7 +38,6 @@ fn test_windowed_fft_ifft_roundtrip() {
 
     // Generate signal and apply window
     let mut signal = generate_test_signal(N);
-    let original_signal = signal.clone();
     apply_hann_window(&mut signal);
 
     // FFT -> IFFT roundtrip
