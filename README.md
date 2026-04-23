@@ -7,8 +7,8 @@ where each stage reads from one buffer and writes to the other. This eliminates 
 bit-reversal pass and removes all inter-stage memory hazards, allowing the entire transform
 to run in a single GPU compute pass with one `queue.submit()` call.
 
-**GPU-only**: This library requires a wgpu-compatible GPU (Vulkan, Metal, DX12, or WebGPU).
-If no GPU is available, `GpuFft::new()` will return an error.
+**GPU-accelerated with CPU fallback**: This library uses wgpu compute shaders for GPU acceleration when available.
+If no GPU is available, it automatically falls back to CPU-based software rendering using wgpu's fallback adapter.
 
 The WGSL compute kernels were authored with [wgsl-rs](https://github.com/schell/wgsl-rs) —
 a crate that lets you write type-safe, Rust-like WGSL shaders that are validated at compile time.

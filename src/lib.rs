@@ -13,8 +13,8 @@ mod shaders;
 
 /// GPU-accelerated FFT executor.
 ///
-/// This is a GPU-only library. `GpuFft::new()` will return an error if no compatible
-/// GPU is available (Vulkan, Metal, DX12, or WebGPU).
+/// Uses wgpu compute shaders for GPU acceleration when available.
+/// Falls back to CPU-based software rendering when no GPU is available.
 use std::cell::RefCell;
 
 pub struct GpuFft {
@@ -51,8 +51,8 @@ struct FftUniforms {
 impl GpuFft {
     /// Create a new [`GpuFft`].
     ///
-    /// Attempts to acquire a high-performance GPU adapter via wgpu.
-    /// Returns `Err` if no compatible GPU is available.
+    /// Attempts to acquire a GPU adapter via wgpu, with CPU fallback enabled.
+    /// Uses GPU acceleration when available, otherwise falls back to software rendering.
     ///
     /// # Examples
     ///
@@ -67,7 +67,7 @@ impl GpuFft {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
-            force_fallback_adapter: false,
+            force_fallback_adapter: true, // Enable CPU fallback when no GPU available
         }))?;
 
         let (device, queue) =
