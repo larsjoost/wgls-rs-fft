@@ -1,40 +1,32 @@
-# GitHub Actions Ubuntu runner image
-FROM ubuntu:22.04
+# Dockerfile for CI testing of wgls-rs-fft
+# This provides a consistent environment for both local and GitHub CI testing
 
-# Install basic dependencies
+FROM rust:latest
+
+# Install system dependencies required for wgpu/GPU testing
 RUN apt-get update && apt-get install -y \
-    curl \
-    git \
-    build-essential \
-    cmake \
     pkg-config \
-    libssl-dev \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-# Install wgpu dependencies
-RUN apt-get update && apt-get install -y \
     libx11-dev \
     libasound2-dev \
     libudev-dev \
     libwayland-dev \
-    libxkbcommon-dev
+    libxkbcommon-dev \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Set up environment
-ENV CARGO_TERM_COLOR=always
+# Install additional tools
+RUN rustup component add clippy rustfmt
+
+# Set up working directory
 WORKDIR /workspace
 
-# Copy source code
+# Copy the repository contents
 COPY . .
 
-# Build and test (same as GitHub CI)
-RUN cargo build --verbose && \
-    cargo test --verbose && \
-    cargo fmt --check && \
-    cargo clippy -- -D warnings
+# Set environment variables for better error reporting
+ENV RUST_BACKTRACE=1
+ENV CARGO_TERM_COLOR=always
 
-CMD ["cargo", "test", "--verbose"]
+# Make CI script executable
+RUN chmod +x scripts/ci_test.sh

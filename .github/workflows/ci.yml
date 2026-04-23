@@ -15,38 +15,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config \
-            libx11-dev \
-            libasound2-dev \
-            libudev-dev \
-            libwayland-dev \
-            libxkbcommon-dev
-      - name: Make CI script executable
-        run: chmod +x scripts/ci_test.sh
-      - name: Run CI test script
-        # Run the comprehensive CI test script that matches local development
-        run: ./scripts/ci_test.sh
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Build and run CI tests in Docker
+        # Use Docker to ensure consistent environment between local and CI
+        run: ./scripts/run_ci_in_docker.sh
 
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: Make CI script executable
-        run: chmod +x scripts/ci_test.sh
-      - name: Run CI test script
-        # Run the comprehensive CI test script that matches local development
-        run: ./scripts/ci_test.sh
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Build and run CI tests in Docker
+        # Use Docker to ensure consistent environment between local and CI
+        run: ./scripts/run_ci_in_docker.sh
 
   doc-test:
     name: Doc Test

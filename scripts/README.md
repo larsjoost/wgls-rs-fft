@@ -57,7 +57,51 @@ sudo dnf install -y \
 
 ### Running in CI
 
-The GitHub Actions workflow has been updated to use this script. See `.github/workflows/ci.yml` for details.
+The GitHub Actions workflow has been updated to use Docker for consistent environments. See `.github/workflows/ci.yml` for details.
+
+### Docker-Based CI
+
+Both local and GitHub CI now use the same Docker container to ensure identical environments:
+
+```bash
+./scripts/run_ci_in_docker.sh
+```
+
+This script:
+1. Builds a Docker image with all required dependencies
+2. Runs the CI test script inside the container
+3. Preserves test results in your local directory
+
+### Benefits of Docker CI
+
+- **Identical environments**: Local and CI use the same container
+- **No "works on my machine" issues**: Consistent dependencies
+- **Easier debugging**: Reproduce CI issues locally
+- **Isolated testing**: No conflicts with local setup
+
+## Docker Setup
+
+### Build the Docker image manually
+
+```bash
+docker build -t wgls-rs-fft-ci -f Dockerfile.ci .
+```
+
+### Run tests in container manually
+
+```bash
+docker run --rm \
+    -v $(pwd):/workspace \
+    -w /workspace \
+    wgls-rs-fft-ci \
+    ./scripts/ci_test.sh
+```
+
+### Clean up
+
+```bash
+docker rmi wgls-rs-fft-ci
+```
 
 ### Development Workflow
 
