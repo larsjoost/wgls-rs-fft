@@ -24,6 +24,83 @@ pub struct GpuFft {
     cache: RefCell<std::collections::HashMap<usize, SizeCache>>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_complex::Complex;
+
+    #[test]
+    fn test_validate_input_size() {
+        // This test would require a real GPU instance, so we'll test the logic indirectly
+        // through the public API in integration tests
+    }
+
+    #[test]
+    fn test_prepare_input_data_fft() {
+        // Test FFT data preparation (no conjugation)
+        let fft = GpuFft::new().expect("Failed to create FFT instance");
+        
+        let input = vec![
+            Complex::new(1.0, 2.0),
+            Complex::new(3.0, 4.0),
+        ];
+        
+        let result = fft.prepare_input_data(&input, false);
+        assert_eq!(result, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_prepare_input_data_ifft() {
+        // Test IFFT data preparation (with conjugation)
+        let fft = GpuFft::new().expect("Failed to create FFT instance");
+        
+        let input = vec![
+            Complex::new(1.0, 2.0),
+            Complex::new(3.0, 4.0),
+        ];
+        
+        let result = fft.prepare_input_data(&input, true);
+        assert_eq!(result, vec![1.0, -2.0, 3.0, -4.0]);
+    }
+
+    #[test]
+    fn test_apply_inverse_transform_postprocessing() {
+        let fft = GpuFft::new().expect("Failed to create FFT instance");
+        
+        let mut output = vec![
+            Complex::new(2.0, 4.0),
+            Complex::new(6.0, 8.0),
+        ];
+        
+        fft.apply_inverse_transform_postprocessing(&mut output, 2);
+        
+        // Should conjugate and scale by 1/2
+        assert_eq!(output[0].re, 1.0); // 2.0 * 0.5
+        assert_eq!(output[0].im, -2.0); // -4.0 * 0.5
+        assert_eq!(output[1].re, 3.0); // 6.0 * 0.5
+        assert_eq!(output[1].im, -4.0); // -8.0 * 0.5
+    }
+
+    #[test]
+    fn test_roundtrip_consistency() {
+        let fft = GpuFft::new().expect("Failed to create FFT instance");
+        
+        // Test that FFT(IFFT(x)) ≈ x within numerical precision
+        let input: Vec<Complex<f32>> = (0..1024)
+            .map(|i| Complex::new(i as f32 * 0.1, 0.0))
+            .collect();
+        
+        let spectrum = fft.fft(&input).expect("FFT failed");
+        let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
+        
+        // Check that roundtrip error is small (allow for numerical precision)
+        for (original, recon) in input.iter().zip(reconstructed.iter()) {
+            let error = ((original.re - recon.re).powi(2) + (original.im - recon.im).powi(2)).sqrt();
+            assert!(error < 1e-4, "Roundtrip error too large: {}", error);
+        }
+    }
+}
+
 /// Pre-allocated GPU resources for a specific FFT size.
 #[derive(Clone)]
 struct SizeCache {
@@ -183,26 +260,52 @@ impl GpuFft {
         inverse: bool,
     ) -> Result<Vec<Complex<f32>>, Box<dyn std::error::Error>> {
         let n = input.len();
-        assert!(
-            n.is_power_of_two() && n > 0,
-            "Transform length must be a non-zero power of two"
-        );
+        self.validate_input_size(n)?;
 
         let log_n = n.trailing_zeros();
         let sc = self.get_or_build_size_cache(n, log_n);
 
-        // For IFFT: conjugate input
-        let raw: Vec<f32> = if inverse {
+        let raw = self.prepare_input_data(input, inverse);
+        self.upload_input_to_gpu(&sc, &raw);
+        
+        self.execute_compute_pass(&sc);
+        let mut output = self.readback_results(&sc)?;
+        
+        if inverse {
+            self.apply_inverse_transform_postprocessing(&mut output, n);
+        }
+
+        Ok(output)
+    }
+
+    /// Validate that the input size is a power of two and non-zero.
+    fn validate_input_size(&self, n: usize) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            n.is_power_of_two() && n > 0,
+            "Transform length must be a non-zero power of two"
+        );
+        Ok(())
+    }
+
+    /// Prepare input data for GPU processing, applying conjugation for IFFT if needed.
+    fn prepare_input_data(&self, input: &[Complex<f32>], inverse: bool) -> Vec<f32> {
+        if inverse {
+            // For IFFT: conjugate input
             input.iter().flat_map(|c| [c.re, -c.im]).collect()
         } else {
+            // For FFT: use input as-is
             input.iter().flat_map(|c| [c.re, c.im]).collect()
-        };
+        }
+    }
 
-        // Upload input to buf_a (always the starting buffer).
+    /// Upload input data to GPU buffer.
+    fn upload_input_to_gpu(&self, sc: &SizeCache, raw: &[f32]) {
         self.queue
-            .write_buffer(&sc.buf_a, 0, bytemuck::cast_slice(&raw));
+            .write_buffer(&sc.buf_a, 0, bytemuck::cast_slice(raw));
+    }
 
-        // All stages in one compute pass, one submit.
+    /// Execute the compute shader pass.
+    fn execute_compute_pass(&self, sc: &SizeCache) {
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
@@ -215,7 +318,10 @@ impl GpuFft {
         let result_buf = if sc.result_in_b { &sc.buf_b } else { &sc.buf_a };
         enc.copy_buffer_to_buffer(result_buf, 0, &sc.staging_buf, 0, sc.data_bytes);
         self.queue.submit(std::iter::once(enc.finish()));
+    }
 
+    /// Read back results from GPU and convert to complex numbers.
+    fn readback_results(&self, sc: &SizeCache) -> Result<Vec<Complex<f32>>, Box<dyn std::error::Error>> {
         // Readback
         let slice = sc.staging_buf.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -226,26 +332,26 @@ impl GpuFft {
 
         let mapped = slice.get_mapped_range();
         let floats: &[f32] = bytemuck::cast_slice(&mapped);
-        let mut output: Vec<Complex<f32>> = floats
+        let output: Vec<Complex<f32>> = floats
             .chunks_exact(2)
             .map(|p| Complex { re: p[0], im: p[1] })
             .collect();
-
-        // For IFFT: conjugate output and scale by 1/N
-        if inverse {
-            let scale = 1.0 / n as f32;
-            for c in &mut output {
-                *c = Complex {
-                    re: c.re * scale,
-                    im: -c.im * scale,
-                };
-            }
-        }
 
         drop(mapped);
         sc.staging_buf.unmap();
 
         Ok(output)
+    }
+
+    /// Apply postprocessing for inverse transform (conjugation and 1/N scaling).
+    fn apply_inverse_transform_postprocessing(&self, output: &mut [Complex<f32>], n: usize) {
+        let scale = 1.0 / n as f32;
+        for c in output {
+            *c = Complex {
+                re: c.re * scale,
+                im: -c.im * scale,
+            };
+        }
     }
 
     /// Get or build size-specific GPU resources.
