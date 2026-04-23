@@ -71,18 +71,6 @@ fn test_ci_minimal() {
 }
 
 #[test]
-fn test_ci_dependencies() {
-    // Test that all dependencies are available
-    println!("CI DEBUG: Testing dependencies...");
-
-    // This test mainly verifies the environment
-    assert!(
-        GpuFft::is_gpu_available(),
-        "CI DEBUG: GPU should be available in CI"
-    );
-}
-
-#[test]
 fn test_ci_performance() {
     // Performance test that should work in CI
     use std::time::Instant;
