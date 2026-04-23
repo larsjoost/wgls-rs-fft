@@ -16,7 +16,7 @@ fn make_test_signal(n: usize) -> Vec<Complex<f32>> {
 
 #[test]
 fn test_ifft_roundtrip() {
-    let fft = GpuFft::new();
+    let fft = GpuFft::new().expect("GPU required");
     let original = make_test_signal(N);
 
     // Forward FFT
@@ -42,7 +42,7 @@ fn test_ifft_roundtrip() {
 
 #[test]
 fn test_ifft_matches_rustfft() {
-    let fft = GpuFft::new();
+    let fft = GpuFft::new().expect("GPU required");
 
     // Create a time-domain signal and compute its FFT first
     let time_domain = make_test_signal(N);
@@ -86,7 +86,7 @@ fn test_ifft_matches_rustfft() {
 
 #[test]
 fn test_fft_ifft_properties() {
-    let fft = GpuFft::new();
+    let fft = GpuFft::new().expect("GPU required");
     let input = make_test_signal(N);
 
     // FFT then IFFT should return scaled original

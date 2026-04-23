@@ -46,7 +46,7 @@ fn test_ci_minimal() {
                     println!("CI DEBUG: IFFT successful");
                     
                     // Verify roundtrip
-                    let mut max_error = 0.0;
+                    let mut max_error = 0.0f32;
                     for (orig, recon) in signal.iter().zip(reconstructed.iter()) {
                         let error = ((orig.re - recon.re).powi(2) + (orig.im - recon.im).powi(2)).sqrt();
                         max_error = max_error.max(error);

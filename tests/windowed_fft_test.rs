@@ -34,7 +34,7 @@ fn generate_test_signal(n: usize) -> Vec<Complex<f32>> {
 
 #[test]
 fn test_windowed_fft_ifft_roundtrip() {
-    let fft = GpuFft::new();
+    let fft = GpuFft::new().expect("GPU required");
 
     // Generate signal and apply window
     let mut signal = generate_test_signal(N);
@@ -62,7 +62,7 @@ fn test_windowed_fft_ifft_roundtrip() {
 
 #[test]
 fn test_window_function_properties() {
-    let fft = GpuFft::new();
+    let fft = GpuFft::new().expect("GPU required");
 
     // Generate signal
     let mut signal = generate_test_signal(N);
@@ -99,7 +99,7 @@ fn test_window_function_properties() {
 
 #[test]
 fn test_multiple_window_types() {
-    let fft = GpuFft::new();
+    let fft = GpuFft::new().expect("GPU required");
     let mut signal = generate_test_signal(N);
 
     // Test Hann window (already implemented)
@@ -118,7 +118,7 @@ fn test_multiple_window_types() {
 
 #[test]
 fn test_frequency_detection() {
-    let fft = GpuFft::new();
+    let fft = GpuFft::new().expect("GPU required");
 
     // Generate signal with known frequencies
     let mut signal = generate_test_signal(N);

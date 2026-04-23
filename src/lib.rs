@@ -58,7 +58,7 @@ impl GpuFft {
     /// ```no_run
     /// use wgls_rs_fft::GpuFft;
     ///
-    /// let fft = GpuFft::new()?;
+    /// let fft = GpuFft::new().expect("GPU required");
     /// // Now use fft.fft() and fft.ifft()
     /// ```
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {

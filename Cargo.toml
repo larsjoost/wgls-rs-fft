@@ -1,6 +1,6 @@
 [package]
 name        = "wgls-rs-fft"
-version     = "0.1.0"
+version     = "0.0.0-reserved"
 edition     = "2021"
 description = "GPU-accelerated FFT using wgpu compute shaders (Cooley-Tukey radix-2 DIT)"
 license     = "MIT"
