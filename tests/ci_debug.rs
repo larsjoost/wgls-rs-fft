@@ -17,11 +17,12 @@ fn test_ci_minimal() {
         return; // Skip test if no GPU
     }
 
-    // Create FFT instance
+    // Create FFT instance with robust error handling
     let fft = match GpuFft::new() {
         Ok(fft) => fft,
         Err(e) => {
             println!("CI DEBUG: Failed to create FFT: {}", e);
+            println!("CI DEBUG: This can happen in resource-constrained environments");
             return;
         }
     };
