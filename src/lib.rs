@@ -39,12 +39,9 @@ mod tests {
     fn test_prepare_input_data_fft() {
         // Test FFT data preparation (no conjugation)
         let fft = GpuFft::new().expect("Failed to create FFT instance");
-        
-        let input = vec![
-            Complex::new(1.0, 2.0),
-            Complex::new(3.0, 4.0),
-        ];
-        
+
+        let input = vec![Complex::new(1.0, 2.0), Complex::new(3.0, 4.0)];
+
         let result = fft.prepare_input_data(&input, false);
         assert_eq!(result, vec![1.0, 2.0, 3.0, 4.0]);
     }
@@ -53,12 +50,9 @@ mod tests {
     fn test_prepare_input_data_ifft() {
         // Test IFFT data preparation (with conjugation)
         let fft = GpuFft::new().expect("Failed to create FFT instance");
-        
-        let input = vec![
-            Complex::new(1.0, 2.0),
-            Complex::new(3.0, 4.0),
-        ];
-        
+
+        let input = vec![Complex::new(1.0, 2.0), Complex::new(3.0, 4.0)];
+
         let result = fft.prepare_input_data(&input, true);
         assert_eq!(result, vec![1.0, -2.0, 3.0, -4.0]);
     }
@@ -66,14 +60,11 @@ mod tests {
     #[test]
     fn test_apply_inverse_transform_postprocessing() {
         let fft = GpuFft::new().expect("Failed to create FFT instance");
-        
-        let mut output = vec![
-            Complex::new(2.0, 4.0),
-            Complex::new(6.0, 8.0),
-        ];
-        
+
+        let mut output = vec![Complex::new(2.0, 4.0), Complex::new(6.0, 8.0)];
+
         fft.apply_inverse_transform_postprocessing(&mut output, 2);
-        
+
         // Should conjugate and scale by 1/2
         assert_eq!(output[0].re, 1.0); // 2.0 * 0.5
         assert_eq!(output[0].im, -2.0); // -4.0 * 0.5
@@ -84,18 +75,19 @@ mod tests {
     #[test]
     fn test_roundtrip_consistency() {
         let fft = GpuFft::new().expect("Failed to create FFT instance");
-        
+
         // Test that FFT(IFFT(x)) ≈ x within numerical precision
         let input: Vec<Complex<f32>> = (0..1024)
             .map(|i| Complex::new(i as f32 * 0.1, 0.0))
             .collect();
-        
+
         let spectrum = fft.fft(&input).expect("FFT failed");
         let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
-        
+
         // Check that roundtrip error is small (allow for numerical precision)
         for (original, recon) in input.iter().zip(reconstructed.iter()) {
-            let error = ((original.re - recon.re).powi(2) + (original.im - recon.im).powi(2)).sqrt();
+            let error =
+                ((original.re - recon.re).powi(2) + (original.im - recon.im).powi(2)).sqrt();
             assert!(error < 1e-4, "Roundtrip error too large: {}", error);
         }
     }
@@ -267,10 +259,10 @@ impl GpuFft {
 
         let raw = self.prepare_input_data(input, inverse);
         self.upload_input_to_gpu(&sc, &raw);
-        
+
         self.execute_compute_pass(&sc);
         let mut output = self.readback_results(&sc)?;
-        
+
         if inverse {
             self.apply_inverse_transform_postprocessing(&mut output, n);
         }
@@ -321,7 +313,10 @@ impl GpuFft {
     }
 
     /// Read back results from GPU and convert to complex numbers.
-    fn readback_results(&self, sc: &SizeCache) -> Result<Vec<Complex<f32>>, Box<dyn std::error::Error>> {
+    fn readback_results(
+        &self,
+        sc: &SizeCache,
+    ) -> Result<Vec<Complex<f32>>, Box<dyn std::error::Error>> {
         // Readback
         let slice = sc.staging_buf.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
