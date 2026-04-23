@@ -58,6 +58,7 @@ struct SizeCache {
     buf_b: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
     /// Precomputed twiddle factors: N/2 complex pairs (cos, sin) of e^{-2πij/N}.
+    #[allow(dead_code)]
     twiddle_buf: wgpu::Buffer,
     data_bytes: u64,
     /// One bind group per stage, pre-wired to the correct SRC/DST buffer pair.
@@ -361,17 +362,13 @@ impl GpuBackend {
         enc.copy_buffer_to_buffer(result_buf, 0, &sc.staging_buf, 0, sc.data_bytes);
         self.queue.submit(std::iter::once(enc.finish()));
 
-        // Readback
+        // Readback with optimized synchronization
         let slice = sc.staging_buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel::<Result<(), wgpu::BufferAsyncError>>();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
+        slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::PollType::Wait {
             submission_index: None,
             timeout: None,
         })?;
-        rx.recv()??;
 
         let mapped = slice.get_mapped_range();
         let floats: &[f32] = bytemuck::cast_slice(&mapped);
@@ -411,11 +408,9 @@ fn cpu_fft(input: &[Complex<f32>]) -> Vec<Complex<f32>> {
         shaders::stockham::U.set(vec4u(n as u32, stage, log_n, 0));
         shaders::stockham::SRC.set(a);
         shaders::stockham::DST.set(b);
-        dispatch_workgroups(
-            ((n as u32 / 2).div_ceil(64), 1, 1),
-            (64, 1, 1),
-            |inv| shaders::stockham::main(inv.global_invocation_id),
-        );
+        dispatch_workgroups(((n as u32 / 2).div_ceil(64), 1, 1), (64, 1, 1), |inv| {
+            shaders::stockham::main(inv.global_invocation_id)
+        });
         a = shaders::stockham::DST.get().clone();
         b = shaders::stockham::SRC.get().clone();
     }
