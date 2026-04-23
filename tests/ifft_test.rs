@@ -2,9 +2,14 @@ use num_complex::Complex;
 use rustfft::FftPlanner;
 use wgls_rs_fft::GpuFft;
 
+mod test_utils;
+use test_utils::*;
+
 const N: usize = 1024;
 const EPSILON: f32 = 1e-3;
 
+/// Generate a different test signal for IFFT tests
+/// This creates a signal with different frequency characteristics
 fn make_test_signal(n: usize) -> Vec<Complex<f32>> {
     (0..n)
         .map(|i| Complex {
@@ -16,28 +21,11 @@ fn make_test_signal(n: usize) -> Vec<Complex<f32>> {
 
 #[test]
 fn test_ifft_roundtrip() {
-    let fft = GpuFft::new().expect("GPU required");
+    let fft = create_test_fft();
     let original = make_test_signal(N);
 
-    // Forward FFT
-    let spectrum = fft.fft(&original).expect("FFT failed");
-    assert_eq!(spectrum.len(), N);
-
-    // Inverse FFT
-    let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
-    assert_eq!(reconstructed.len(), N);
-
-    // Check roundtrip accuracy
-    let mut max_diff: f32 = 0.0;
-    for (i, (orig, recon)) in original.iter().zip(reconstructed.iter()).enumerate() {
-        let diff = ((orig.re - recon.re).powi(2) + (orig.im - recon.im).powi(2)).sqrt();
-        max_diff = max_diff.max(diff);
-        assert!(
-            diff < EPSILON,
-            "element {i}: original={orig:?}  reconstructed={recon:?}  diff={diff:.2e}"
-        );
-    }
-    println!("IFFT roundtrip max element-wise error: {max_diff:.2e}");
+    // Test roundtrip accuracy using utility function
+    test_roundtrip_accuracy(&fft, &original, EPSILON);
 }
 
 #[test]

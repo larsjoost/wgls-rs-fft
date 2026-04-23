@@ -69,9 +69,10 @@ impl GpuFft {
             force_fallback_adapter: false,
         }))?;
 
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            ..Default::default()
-        }))?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                ..Default::default()
+            }))?;
 
         let shader_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("stockham"),
@@ -107,7 +108,8 @@ impl GpuFft {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
-        })).is_ok()
+        }))
+        .is_ok()
     }
 
     /// Compute the forward FFT of `input`.
@@ -147,7 +149,8 @@ impl GpuFft {
 
         // Upload input to buf_a (always the starting buffer).
         let raw: Vec<f32> = input.iter().flat_map(|c| [c.re, c.im]).collect();
-        self.queue.write_buffer(&sc.buf_a, 0, bytemuck::cast_slice(&raw));
+        self.queue
+            .write_buffer(&sc.buf_a, 0, bytemuck::cast_slice(&raw));
 
         // All stages in one compute pass, one submit.
         let mut enc = self.device.create_command_encoder(&Default::default());
@@ -222,7 +225,10 @@ impl GpuFft {
         // Conjugate input
         let conjugated: Vec<Complex<f32>> = input
             .iter()
-            .map(|c| Complex { re: c.re, im: -c.im })
+            .map(|c| Complex {
+                re: c.re,
+                im: -c.im,
+            })
             .collect();
 
         // Compute FFT of conjugated input

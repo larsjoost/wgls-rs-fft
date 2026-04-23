@@ -1,62 +1,22 @@
 use num_complex::Complex;
 use wgls_rs_fft::GpuFft;
 
+mod test_utils;
+use test_utils::*;
+
 const N: usize = 2048;
 const EPSILON: f32 = 1e-3;
 
-/// Apply Hann window function
-fn apply_hann_window(signal: &mut [Complex<f32>]) {
-    let n = signal.len();
-    for (i, sample) in signal.iter_mut().enumerate() {
-        let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (n - 1) as f32).cos());
-        *sample = Complex {
-            re: sample.re * window,
-            im: sample.im * window,
-        };
-    }
-}
-
-/// Generate a test signal with known frequencies
-fn generate_test_signal(n: usize) -> Vec<Complex<f32>> {
-    (0..n)
-        .map(|i| {
-            let t = i as f32 / n as f32;
-            // 10Hz and 50Hz sine waves
-            let signal = 0.7 * (2.0 * std::f32::consts::PI * 10.0 * t).sin()
-                + 0.3 * (2.0 * std::f32::consts::PI * 50.0 * t).sin();
-            Complex {
-                re: signal,
-                im: 0.0,
-            }
-        })
-        .collect()
-}
-
 #[test]
 fn test_windowed_fft_ifft_roundtrip() {
-    let fft = GpuFft::new().expect("GPU required");
+    let fft = create_test_fft();
 
     // Generate signal and apply window
     let mut signal = generate_test_signal(N);
     apply_hann_window(&mut signal);
 
-    // FFT -> IFFT roundtrip
-    let spectrum = fft.fft(&signal).expect("FFT failed");
-    let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
-
-    // Verify roundtrip accuracy
-    assert_eq!(reconstructed.len(), N);
-
-    let mut max_diff: f32 = 0.0;
-    for (i, (orig, recon)) in signal.iter().zip(reconstructed.iter()).enumerate() {
-        let diff = ((orig.re - recon.re).powi(2) + (orig.im - recon.im).powi(2)).sqrt();
-        max_diff = max_diff.max(diff);
-        assert!(
-            diff < EPSILON,
-            "element {i}: original={orig:?}  reconstructed={recon:?}  diff={diff:.2e}"
-        );
-    }
-    println!("Windowed FFT->IFFT roundtrip max error: {max_diff:.2e}");
+    // Test roundtrip accuracy using utility function
+    test_roundtrip_accuracy(&fft, &signal, EPSILON);
 }
 
 #[test]
