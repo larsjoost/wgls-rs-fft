@@ -18,7 +18,7 @@ fn make_input(n: usize) -> Vec<Complex<f32>> {
 fn test_gpu_fft_matches_rustfft() {
     let input = make_input(N);
 
-    let gpu = GpuFft::new().expect("GpuFft init failed");
+    let gpu = GpuFft::new();
     let gpu_out = gpu.fft(&input).expect("GPU FFT failed");
 
     let mut planner = FftPlanner::<f32>::new();
