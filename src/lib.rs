@@ -97,6 +97,9 @@ impl GpuFft {
     /// If no compatible GPU is found, transparently falls back to the
     /// wgsl-rs CPU runtime running the same shader code.
     pub fn new() -> Self {
+        // Initialize CPU runtime early in case we need to fall back
+        ensure_cpu_runtime_initialized();
+
         match pollster::block_on(GpuBackend::try_new()) {
             Ok(gpu) => Self {
                 backend: Backend::Gpu(gpu),
