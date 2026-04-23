@@ -2,9 +2,11 @@
 //! with automatic CPU fallback via the [wgsl-rs](https://github.com/schell/wgsl-rs)
 //! software rasterizer when no GPU is available.
 //!
-//! Implements the Cooley-Tukey radix-2 decimation-in-time (DIT) FFT entirely
-//! on the GPU via two WGSL compute kernels, or on the CPU using the same
-//! shader code run through the wgsl-rs CPU runtime.
+//! Implements the **Stockham autosort** radix-2 FFT: a two-buffer ping-pong
+//! formulation where each stage reads from one buffer and writes to the other.
+//! This eliminates the separate bit-reversal pass and removes all inter-stage
+//! memory hazards, allowing the entire transform to run in a single GPU
+//! compute pass with one `queue.submit()` call.
 //!
 //! # Example
 //!
@@ -37,7 +39,7 @@ use std::sync::{Arc, Mutex};
 use num_complex::Complex;
 use wgsl_rs::std::*;
 
-/// Uniforms passed to each compute shader (16-byte aligned).
+/// Uniforms passed to the compute shader (16-byte aligned).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct FftUniforms {
@@ -49,24 +51,24 @@ struct FftUniforms {
 
 /// Pre-allocated GPU resources for a specific FFT size.
 ///
-/// Built once per size on first use, then reused across calls.
+/// Built once on first use for each size and reused across all subsequent calls.
 struct SizeCache {
-    storage_buf: wgpu::Buffer,
+    /// Ping-pong buffers: stage even reads A, writes B; stage odd reads B, writes A.
+    buf_a: wgpu::Buffer,
+    buf_b: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
     data_bytes: u64,
-    bit_rev_bg: wgpu::BindGroup,
-    /// One bind group per FFT stage, each pinned to its own uniform slice.
+    /// One bind group per stage, pre-wired to the correct SRC/DST buffer pair.
     stage_bgs: Vec<wgpu::BindGroup>,
-    wg_n: u32,
+    /// True when the final result lands in buf_b (i.e. log_n is odd).
+    result_in_b: bool,
     wg_n2: u32,
 }
 
-/// State needed when a real GPU is available.
 struct GpuBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    bit_reverse_pipeline: wgpu::ComputePipeline,
-    fft_stage_pipeline: wgpu::ComputePipeline,
+    pipeline: wgpu::ComputePipeline,
     cache: Mutex<HashMap<usize, Arc<SizeCache>>>,
 }
 
@@ -167,32 +169,20 @@ impl GpuBackend {
             })
             .await?;
 
-        let bit_rev_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("bit_reverse"),
+        let shader_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("stockham"),
             source: wgpu::ShaderSource::Wgsl(
-                shaders::bit_reverse::WGSL_MODULE.wgsl_source().join("\n").into(),
-            ),
-        });
-        let fft_stage_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("fft_stage"),
-            source: wgpu::ShaderSource::Wgsl(
-                shaders::fft_stage::WGSL_MODULE.wgsl_source().join("\n").into(),
+                shaders::stockham::WGSL_MODULE
+                    .wgsl_source()
+                    .join("\n")
+                    .into(),
             ),
         });
 
-        let bit_reverse_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("bit_reverse_pipeline"),
-                layout: None,
-                module: &bit_rev_mod,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let fft_stage_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("fft_stage_pipeline"),
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("stockham_pipeline"),
             layout: None,
-            module: &fft_stage_mod,
+            module: &shader_mod,
             entry_point: Some("main"),
             compilation_options: Default::default(),
             cache: None,
@@ -201,13 +191,11 @@ impl GpuBackend {
         Ok(Self {
             device,
             queue,
-            bit_reverse_pipeline,
-            fft_stage_pipeline,
+            pipeline,
             cache: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Return the cached `SizeCache` for `n`, building it if this is the first call.
     fn get_or_build(&self, n: usize, log_n: u32) -> Arc<SizeCache> {
         {
             let guard = self.cache.lock().unwrap();
@@ -215,7 +203,6 @@ impl GpuBackend {
                 return Arc::clone(sc);
             }
         }
-        // Build outside the lock so device ops don't block other sizes.
         let sc = Arc::new(self.build_size_cache(n, log_n));
         self.cache
             .lock()
@@ -225,23 +212,25 @@ impl GpuBackend {
         sc
     }
 
-    /// Allocate GPU buffers and pre-bake bind groups for a given FFT size.
+    /// Allocate the ping-pong buffers and pre-bake all per-stage bind groups.
     ///
-    /// The uniform buffer holds all `1 + log_n` parameter sets (bit-reversal +
-    /// one per butterfly stage) at properly aligned offsets, so every dispatch
-    /// can be encoded without any interleaved `write_buffer` calls.
+    /// The uniform buffer holds one `FftUniforms` per stage at aligned offsets,
+    /// so no `write_buffer` calls are needed during the hot `fft()` path.
     fn build_size_cache(&self, n: usize, log_n: u32) -> SizeCache {
         let data_bytes = (n * 2 * size_of::<f32>()) as u64;
 
-        let storage_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("fft_storage"),
-            size: data_bytes,
-            // COPY_DST: lets write_buffer upload input; COPY_SRC: lets us copy to staging.
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let make_buf = |label| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: data_bytes,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let buf_a = make_buf("fft_buf_a");
+        let buf_b = make_buf("fft_buf_b");
         let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fft_staging"),
             size: data_bytes,
@@ -249,34 +238,21 @@ impl GpuBackend {
             mapped_at_creation: false,
         });
 
-        // Uniform buffer: one slot per (bit-reversal + log_n stages), stride-aligned.
+        // Uniform buffer: one slot per stage, stride-aligned.
         let alignment = self.device.limits().min_uniform_buffer_offset_alignment as u64;
         let entry_bytes = size_of::<FftUniforms>() as u64;
         let stride = entry_bytes.div_ceil(alignment) * alignment;
-        let uniform_total = stride * (1 + log_n as u64);
 
         let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fft_uniforms"),
-            size: uniform_total,
+            size: stride * log_n as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
-        // Write all uniform data up front — these are flushed before the first submit.
-        self.queue.write_buffer(
-            &uniform_buf,
-            0,
-            bytemuck::bytes_of(&FftUniforms {
-                n: n as u32,
-                stage: 0,
-                log_n,
-                _pad: 0,
-            }),
-        );
         for stage in 0..log_n {
             self.queue.write_buffer(
                 &uniform_buf,
-                stride * (1 + stage as u64),
+                stride * stage as u64,
                 bytemuck::bytes_of(&FftUniforms {
                     n: n as u32,
                     stage,
@@ -286,12 +262,13 @@ impl GpuBackend {
             );
         }
 
-        // Build one bind group per dispatch, each pointing at its own uniform slice.
+        // Pre-bake bind groups: even stages read A / write B, odd stages read B / write A.
         let uniform_size = NonZeroU64::new(entry_bytes);
-        let make_bg = |pipeline: &wgpu::ComputePipeline, uniform_offset: u64| {
+        let layout = self.pipeline.get_bind_group_layout(0);
+        let make_bg = |src: &wgpu::Buffer, dst: &wgpu::Buffer, uniform_offset: u64| {
             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
-                layout: &pipeline.get_bind_group_layout(0),
+                layout: &layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -303,24 +280,34 @@ impl GpuBackend {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: storage_buf.as_entire_binding(),
+                        resource: src.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: dst.as_entire_binding(),
                     },
                 ],
             })
         };
 
-        let bit_rev_bg = make_bg(&self.bit_reverse_pipeline, 0);
         let stage_bgs = (0..log_n as usize)
-            .map(|s| make_bg(&self.fft_stage_pipeline, stride * (1 + s as u64)))
+            .map(|s| {
+                let (src, dst) = if s % 2 == 0 {
+                    (&buf_a, &buf_b)
+                } else {
+                    (&buf_b, &buf_a)
+                };
+                make_bg(src, dst, stride * s as u64)
+            })
             .collect();
 
         SizeCache {
-            storage_buf,
+            buf_a,
+            buf_b,
             staging_buf,
             data_bytes,
-            bit_rev_bg,
             stage_bgs,
-            wg_n: (n as u32).div_ceil(64),
+            result_in_b: log_n % 2 == 1,
             wg_n2: (n as u32 / 2).div_ceil(64),
         }
     }
@@ -330,28 +317,24 @@ impl GpuBackend {
         let log_n = n.trailing_zeros();
         let sc = self.get_or_build(n, log_n);
 
-        // Upload input — arrives before the first dispatch in the submit below.
+        // Upload input to buf_a (always the starting buffer).
         let raw: Vec<f32> = input.iter().flat_map(|c| [c.re, c.im]).collect();
         self.queue
-            .write_buffer(&sc.storage_buf, 0, bytemuck::cast_slice(&raw));
+            .write_buffer(&sc.buf_a, 0, bytemuck::cast_slice(&raw));
 
-        // Encode everything in one command buffer: bit-reversal, all FFT stages,
-        // and the readback copy. A separate compute pass per dispatch ensures the
-        // GPU sees each stage's writes before the next one begins.
+        // All stages in one compute pass, one submit.
+        // No barriers needed: consecutive stages access different buffers (A vs B).
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.bit_reverse_pipeline);
-            pass.set_bind_group(0, &sc.bit_rev_bg, &[]);
-            pass.dispatch_workgroups(sc.wg_n, 1, 1);
+            pass.set_pipeline(&self.pipeline);
+            for bg in &sc.stage_bgs {
+                pass.set_bind_group(0, bg, &[]);
+                pass.dispatch_workgroups(sc.wg_n2, 1, 1);
+            }
         }
-        for bg in &sc.stage_bgs {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.fft_stage_pipeline);
-            pass.set_bind_group(0, bg, &[]);
-            pass.dispatch_workgroups(sc.wg_n2, 1, 1);
-        }
-        enc.copy_buffer_to_buffer(&sc.storage_buf, 0, &sc.staging_buf, 0, sc.data_bytes);
+        let result_buf = if sc.result_in_b { &sc.buf_b } else { &sc.buf_a };
+        enc.copy_buffer_to_buffer(result_buf, 0, &sc.staging_buf, 0, sc.data_bytes);
         self.queue.submit(std::iter::once(enc.finish()));
 
         // Readback
@@ -380,42 +363,40 @@ impl GpuBackend {
 }
 
 // ---------------------------------------------------------------------------
-// CPU fallback — runs the exact same wgsl-rs shader code via the CPU runtime
+// CPU fallback — runs the same Stockham kernel via the wgsl-rs CPU runtime.
 // ---------------------------------------------------------------------------
 
 fn cpu_fft(input: &[Complex<f32>]) -> Vec<Complex<f32>> {
     let n = input.len();
     let log_n = n.trailing_zeros();
 
-    // Pack Complex<f32> → interleaved f32 → RuntimeArray
-    let mut data = RuntimeArray::with_capacity(n * 2);
+    // Pack input into RuntimeArray (the wgsl-rs CPU buffer type).
+    let mut a = RuntimeArray::with_capacity(n * 2);
     for c in input {
-        data.push(c.re);
-        data.push(c.im);
+        a.push(c.re);
+        a.push(c.im);
+    }
+    let mut b = RuntimeArray::with_capacity(n * 2);
+    for _ in 0..n * 2 {
+        b.push(0.0_f32);
     }
 
-    // --- Bit-reversal pass ---
-    shaders::bit_reverse::U.set(vec4u(n as u32, 0, log_n, 0));
-    shaders::bit_reverse::DATA.set(data);
-    dispatch_workgroups(((n as u32).div_ceil(64), 1, 1), (64, 1, 1), |b| {
-        shaders::bit_reverse::main(b.global_invocation_id)
-    });
-    // Move data from bit_reverse module into fft_stage module
-    let data = shaders::bit_reverse::DATA.get().clone();
-
-    // --- Butterfly stages ---
-    shaders::fft_stage::DATA.set(data);
+    // Each stage: set SRC=a, DST=b, dispatch, then swap:
+    // a ← DST output, b ← old SRC (will be overwritten next stage).
     for stage in 0..log_n {
-        shaders::fft_stage::U.set(vec4u(n as u32, stage, log_n, 0));
-        dispatch_workgroups(((n as u32 / 2).div_ceil(64), 1, 1), (64, 1, 1), |b| {
-            shaders::fft_stage::main(b.global_invocation_id)
-        });
+        shaders::stockham::U.set(vec4u(n as u32, stage, log_n, 0));
+        shaders::stockham::SRC.set(a);
+        shaders::stockham::DST.set(b);
+        dispatch_workgroups(
+            ((n as u32 / 2).div_ceil(64), 1, 1),
+            (64, 1, 1),
+            |inv| shaders::stockham::main(inv.global_invocation_id),
+        );
+        a = shaders::stockham::DST.get().clone();
+        b = shaders::stockham::SRC.get().clone();
     }
 
-    // Unpack RuntimeArray → Vec<Complex<f32>>
-    let result = shaders::fft_stage::DATA.get();
-    result
-        .data
+    a.data
         .chunks_exact(2)
         .map(|p| Complex { re: p[0], im: p[1] })
         .collect()

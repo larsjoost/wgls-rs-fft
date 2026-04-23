@@ -3,87 +3,64 @@
 
 use wgsl_rs::wgsl;
 
-/// Bit-reversal permutation kernel.
-/// Uniform U (.x=n, .z=log_n); Storage DATA: interleaved [re0,im0,re1,im1,...]
+/// Stockham autosort FFT kernel.
+///
+/// Each stage reads from SRC and writes to DST — the two buffers ping-pong
+/// between stages, so there is never a read-write hazard between consecutive
+/// dispatches. Output is in natural order; no bit-reversal pass is needed.
+///
+/// Uniform U: .x = N, .y = stage index (0 … log₂N − 1).
+/// SRC / DST: interleaved complex pairs [re₀, im₀, re₁, im₁, …].
 #[wgsl]
-pub mod bit_reverse {
-    use wgsl_rs::std::*;
-
-    uniform!(group(0), binding(0), U: Vec4u);
-    storage!(group(0), binding(1), read_write, DATA: RuntimeArray<f32>);
-
-    pub fn rev(x: u32, bits: u32) -> u32 {
-        reverse_bits(x) >> (32u32 - bits)
-    }
-
-    #[compute]
-    #[workgroup_size(64)]
-    pub fn main(#[builtin(global_invocation_id)] gid: Vec3u) {
-        let i = gid.x;
-        let n = get!(U).x;
-        let log_n = get!(U).z;
-        if i >= n {
-            return;
-        }
-        let j = rev(i, log_n);
-        if j <= i {
-            return;
-        }
-        let re_i = get!(DATA)[2 * i];
-        let im_i = get!(DATA)[2 * i + 1];
-        let re_j = get!(DATA)[2 * j];
-        let im_j = get!(DATA)[2 * j + 1];
-        get_mut!(DATA)[2 * i] = re_j;
-        get_mut!(DATA)[2 * i + 1] = im_j;
-        get_mut!(DATA)[2 * j] = re_i;
-        get_mut!(DATA)[2 * j + 1] = im_i;
-    }
-}
-
-/// Cooley-Tukey butterfly kernel — one pass per FFT stage.
-/// Uniform U (.x=n, .y=stage); Storage DATA: interleaved [re0,im0,re1,im1,...]
-#[wgsl]
-pub mod fft_stage {
+pub mod stockham {
     use wgsl_rs::std::*;
 
     const PI: f32 = 3.14159265358979;
 
     uniform!(group(0), binding(0), U: Vec4u);
-    storage!(group(0), binding(1), read_write, DATA: RuntimeArray<f32>);
+    storage!(group(0), binding(1), read_write, SRC: RuntimeArray<f32>);
+    storage!(group(0), binding(2), read_write, DST: RuntimeArray<f32>);
 
     #[compute]
     #[workgroup_size(64)]
     pub fn main(#[builtin(global_invocation_id)] gid: Vec3u) {
         let tid = gid.x;
         let n = get!(U).x;
-        let stage = get!(U).y;
-        if tid >= (n >> 1u32) {
+        let half_n = n >> 1u32;
+        if tid >= half_n {
             return;
         }
 
-        let half_span = 1u32 << stage;
-        let full_span = half_span + half_span;
-        let grp = tid / half_span;
-        let pos = tid % half_span;
+        let stage = get!(U).y;
+        let p = 1u32 << stage;
+        let two_p = p + p;
 
-        let idx1 = grp * full_span + pos;
-        let idx2 = idx1 + half_span;
+        let k = tid % p;
+        let j = tid / p;
 
-        let angle = -2.0 * PI * pos as f32 / full_span as f32;
+        // Source: natural-order read (Stockham DIT).
+        let i1 = j * p + k;
+        let i2 = i1 + half_n;
+
+        let re1 = get!(SRC)[2 * i1];
+        let im1 = get!(SRC)[2 * i1 + 1];
+        let re2 = get!(SRC)[2 * i2];
+        let im2 = get!(SRC)[2 * i2 + 1];
+
+        let angle = -2.0 * PI * k as f32 / two_p as f32;
         let wr = cos(angle);
         let wi = sin(angle);
-
-        let re1 = get!(DATA)[2 * idx1];
-        let im1 = get!(DATA)[2 * idx1 + 1];
-        let re2 = get!(DATA)[2 * idx2];
-        let im2 = get!(DATA)[2 * idx2 + 1];
 
         let tr = wr * re2 - wi * im2;
         let ti = wr * im2 + wi * re2;
 
-        get_mut!(DATA)[2 * idx1] = re1 + tr;
-        get_mut!(DATA)[2 * idx1 + 1] = im1 + ti;
-        get_mut!(DATA)[2 * idx2] = re1 - tr;
-        get_mut!(DATA)[2 * idx2 + 1] = im1 - ti;
+        // Destination: shuffled write for autosort ordering.
+        let out1 = j * two_p + k;
+        let out2 = out1 + p;
+
+        get_mut!(DST)[2 * out1] = re1 + tr;
+        get_mut!(DST)[2 * out1 + 1] = im1 + ti;
+        get_mut!(DST)[2 * out2] = re1 - tr;
+        get_mut!(DST)[2 * out2 + 1] = im1 - ti;
     }
 }
