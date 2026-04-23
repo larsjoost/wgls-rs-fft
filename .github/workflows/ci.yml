@@ -27,17 +27,11 @@ jobs:
             libudev-dev \
             libwayland-dev \
             libxkbcommon-dev
-      - name: Build
-        run: cargo build --verbose
-      - name: Run tests
-        # Use single threading to avoid GPU resource contention in CI
-        run: cargo test --verbose -- --test-threads=1
-      - name: Check formatting
-        run: cargo fmt --check
-      - name: Run clippy
-        # Note: We allow clippy to pass even with shader warnings since WGSL entry points
-        # are not called from Rust code but are required by the GPU shader system
-        run: cargo clippy --all-targets --all-features -- -D warnings || echo "Clippy completed with expected shader warnings"
+      - name: Make CI script executable
+        run: chmod +x scripts/ci_test.sh
+      - name: Run CI test script
+        # Run the comprehensive CI test script that matches local development
+        run: ./scripts/ci_test.sh
 
   lint:
     name: Lint
@@ -48,12 +42,11 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: cargo fmt
-        run: cargo fmt --check
-      - name: cargo clippy
-        # Note: We allow clippy to pass even with shader warnings since WGSL entry points
-        # are not called from Rust code but are required by the GPU shader system
-        run: cargo clippy --all-targets --all-features -- -D warnings || echo "Clippy completed with expected shader warnings"
+      - name: Make CI script executable
+        run: chmod +x scripts/ci_test.sh
+      - name: Run CI test script
+        # Run the comprehensive CI test script that matches local development
+        run: ./scripts/ci_test.sh
 
   doc-test:
     name: Doc Test
