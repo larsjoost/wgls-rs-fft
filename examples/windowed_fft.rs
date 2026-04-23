@@ -63,11 +63,8 @@ fn main() {
     println!("Applied Hann window to signal");
 
     // Create FFT instance
-    let fft = GpuFft::new();
-    println!(
-        "Using {} backend",
-        if fft.is_gpu_backed() { "GPU" } else { "CPU" }
-    );
+    let fft = GpuFft::new().expect("GPU required");
+    println!("Using GPU backend");
 
     // Performance measurement
     let start = Instant::now();
