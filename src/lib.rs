@@ -444,7 +444,20 @@ impl GpuBackend {
 // CPU fallback — runs the same Stockham kernel via the wgsl-rs CPU runtime.
 // ---------------------------------------------------------------------------
 
+/// Initialize the wgsl-rs CPU runtime if not already initialized
+fn ensure_cpu_runtime_initialized() {
+    // This ensures the wgsl-rs module statics are properly initialized
+    // by accessing them at least once before use
+    use wgsl_rs::std::*;
+
+    // Trigger initialization by accessing module variables
+    let _ = RuntimeArray::<f32>::with_capacity(0);
+    let _ = vec4u(0, 0, 0, 0);
+}
+
 fn cpu_fft(input: &[Complex<f32>]) -> Vec<Complex<f32>> {
+    // Ensure runtime is initialized
+    ensure_cpu_runtime_initialized();
     let n = input.len();
     let log_n = n.trailing_zeros();
 
@@ -479,6 +492,9 @@ fn cpu_fft(input: &[Complex<f32>]) -> Vec<Complex<f32>> {
 }
 
 fn cpu_ifft(input: &[Complex<f32>]) -> Vec<Complex<f32>> {
+    // Ensure runtime is initialized
+    ensure_cpu_runtime_initialized();
+
     let n = input.len();
     let log_n = n.trailing_zeros();
 
