@@ -1,6 +1,3 @@
-// PI must be a literal here — WGSL has no equivalent of f32::consts::PI.
-#![allow(clippy::approx_constant, clippy::excessive_precision)]
-
 use wgsl_rs::wgsl;
 
 /// Stockham autosort FFT kernel.
@@ -11,18 +8,19 @@ use wgsl_rs::wgsl;
 ///
 /// Uniform U: .x = N, .y = stage index (0 … log₂N − 1).
 /// SRC / DST: interleaved complex pairs [re₀, im₀, re₁, im₁, …].
+/// TWIDDLE:   N/2 precomputed pairs [cos₀, sin₀, cos₁, sin₁, …] where
+///            pair j = e^{-2πi·j/N}; accessed at index k*(N/2>>stage).
 #[wgsl]
 pub mod stockham {
     use wgsl_rs::std::*;
 
-    const PI: f32 = 3.14159265358979;
-
     uniform!(group(0), binding(0), U: Vec4u);
     storage!(group(0), binding(1), read_write, SRC: RuntimeArray<f32>);
     storage!(group(0), binding(2), read_write, DST: RuntimeArray<f32>);
+    storage!(group(0), binding(3), TWIDDLE: RuntimeArray<f32>);
 
     #[compute]
-    #[workgroup_size(64)]
+    #[workgroup_size(256)]
     pub fn main(#[builtin(global_invocation_id)] gid: Vec3u) {
         let tid = gid.x;
         let n = get!(U).x;
@@ -47,9 +45,10 @@ pub mod stockham {
         let re2 = get!(SRC)[2 * i2];
         let im2 = get!(SRC)[2 * i2 + 1];
 
-        let angle = -2.0 * PI * k as f32 / two_p as f32;
-        let wr = cos(angle);
-        let wi = sin(angle);
+        // Twiddle lookup: index = k * (half_n / p) = k * (half_n >> stage).
+        let twiddle_idx = k * (half_n >> stage);
+        let wr = get!(TWIDDLE)[2 * twiddle_idx];
+        let wi = get!(TWIDDLE)[2 * twiddle_idx + 1];
 
         let tr = wr * re2 - wi * im2;
         let ti = wr * im2 + wi * re2;

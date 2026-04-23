@@ -57,6 +57,8 @@ struct SizeCache {
     buf_a: wgpu::Buffer,
     buf_b: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
+    /// Precomputed twiddle factors: N/2 complex pairs (cos, sin) of e^{-2πij/N}.
+    twiddle_buf: wgpu::Buffer,
     data_bytes: u64,
     /// One bind group per stage, pre-wired to the correct SRC/DST buffer pair.
     stage_bgs: Vec<wgpu::BindGroup>,
@@ -265,6 +267,23 @@ impl GpuBackend {
         // Pre-bake bind groups: even stages read A / write B, odd stages read B / write A.
         let uniform_size = NonZeroU64::new(entry_bytes);
         let layout = self.pipeline.get_bind_group_layout(0);
+
+        // Precompute twiddle factors: N/2 complex pairs e^{-2πij/N} for j=0..N/2.
+        let twiddles: Vec<f32> = (0..n / 2)
+            .flat_map(|j| {
+                let angle = -std::f32::consts::TAU * j as f32 / n as f32;
+                [angle.cos(), angle.sin()]
+            })
+            .collect();
+        let twiddle_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fft_twiddles"),
+            size: (twiddles.len() * size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&twiddle_buf, 0, bytemuck::cast_slice(&twiddles));
+
         let make_bg = |src: &wgpu::Buffer, dst: &wgpu::Buffer, uniform_offset: u64| {
             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
@@ -286,6 +305,10 @@ impl GpuBackend {
                         binding: 2,
                         resource: dst.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: twiddle_buf.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -305,10 +328,11 @@ impl GpuBackend {
             buf_a,
             buf_b,
             staging_buf,
+            twiddle_buf,
             data_bytes,
             stage_bgs,
             result_in_b: log_n % 2 == 1,
-            wg_n2: (n as u32 / 2).div_ceil(64),
+            wg_n2: (n as u32 / 2).div_ceil(256),
         }
     }
 
