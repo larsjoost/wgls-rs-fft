@@ -37,16 +37,19 @@ fn test_ci_minimal() {
     }
 
     // Test FFT
-    match fft.fft(&signal) {
-        Ok(spectrum) => {
+    let signal_for_fft = signal.clone();
+    match fft.fft(&[signal_for_fft]) {
+        Ok(spectrum_batch) => {
+            let spectrum = &spectrum_batch[0];
             println!(
                 "CI DEBUG: FFT successful, spectrum length: {}",
                 spectrum.len()
             );
 
             // Test IFFT
-            match fft.ifft(&spectrum) {
-                Ok(reconstructed) => {
+            match fft.ifft(&[spectrum.to_vec()]) {
+                Ok(reconstructed_batch) => {
+                    let reconstructed = &reconstructed_batch[0];
                     println!("CI DEBUG: IFFT successful");
 
                     // Verify roundtrip
@@ -84,11 +87,14 @@ fn test_ci_performance() {
     let signal = vec![Complex::new(1.0, 0.0); 4096];
 
     let start = Instant::now();
-    let spectrum = fft.fft(&signal).expect("FFT failed");
+    let signal_for_fft = signal.clone();
+    let spectrum_batch = fft.fft(&[signal_for_fft]).expect("FFT failed");
+    let spectrum = &spectrum_batch[0];
     let fft_time = start.elapsed();
 
     let start = Instant::now();
-    let _reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
+    let _reconstructed_batch = fft.ifft(&[spectrum.to_vec()]).expect("IFFT failed");
+    let _reconstructed = &_reconstructed_batch[0];
     let ifft_time = start.elapsed();
 
     println!("CI DEBUG: FFT: {:?}, IFFT: {:?}", fft_time, ifft_time);

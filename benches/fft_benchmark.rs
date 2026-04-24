@@ -28,16 +28,15 @@ fn benchmark_fft(c: &mut Criterion) {
 
         group.bench_function("Single FFT", |b| {
             b.iter(|| {
-                let _result = fft.fft(black_box(&input)).unwrap();
+                let _result = fft.fft(black_box(&[input.clone()])).unwrap();
             })
         });
 
         // Benchmark batch processing (more realistic workload)
         group.bench_function("Batch of 10 FFTs", |b| {
             b.iter(|| {
-                for _ in 0..10 {
-                    let _result = fft.fft(black_box(&input)).unwrap();
-                }
+                let batch = vec![input.clone(); 10];
+                let _result = fft.fft(black_box(&batch)).unwrap();
             })
         });
 
@@ -61,7 +60,8 @@ fn benchmark_ifft(c: &mut Criterion) {
         .collect();
 
     // First compute FFT to get frequency domain data
-    let spectrum = fft.fft(&input).unwrap();
+    let spectrum_batch = fft.fft(&[input.clone()]).unwrap();
+    let spectrum = &spectrum_batch[0];
 
     let mut group = c.benchmark_group("IFFT");
     group.sample_size(20);
@@ -70,15 +70,14 @@ fn benchmark_ifft(c: &mut Criterion) {
 
     group.bench_function("Single IFFT size 16384", |b| {
         b.iter(|| {
-            let _result = fft.ifft(black_box(&spectrum)).unwrap();
+            let _result = fft.ifft(black_box(&[spectrum.clone()])).unwrap();
         })
     });
 
     group.bench_function("Batch of 5 IFFTs size 16384", |b| {
         b.iter(|| {
-            for _ in 0..5 {
-                let _result = fft.ifft(black_box(&spectrum)).unwrap();
-            }
+            let batch = vec![spectrum.clone(); 5];
+            let _result = fft.ifft(black_box(&batch)).unwrap();
         })
     });
 
@@ -107,17 +106,17 @@ fn benchmark_roundtrip(c: &mut Criterion) {
 
     group.bench_function("Single FFT+IFFT size 8192", |b| {
         b.iter(|| {
-            let spectrum = fft.fft(black_box(&input)).unwrap();
-            let _reconstructed = fft.ifft(black_box(&spectrum)).unwrap();
+            let spectrum_batch = fft.fft(black_box(&[input.clone()])).unwrap();
+            let spectrum = &spectrum_batch[0];
+            let _reconstructed = fft.ifft(black_box(&[spectrum.clone()])).unwrap();
         })
     });
 
     group.bench_function("Batch of 3 roundtrips size 8192", |b| {
         b.iter(|| {
-            for _ in 0..3 {
-                let spectrum = fft.fft(black_box(&input)).unwrap();
-                let _reconstructed = fft.ifft(black_box(&spectrum)).unwrap();
-            }
+            let batch = vec![input.clone(); 3];
+            let spectrum_batch = fft.fft(black_box(&batch)).unwrap();
+            let _reconstructed = fft.ifft(black_box(&spectrum_batch)).unwrap();
         })
     });
 

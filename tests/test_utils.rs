@@ -53,8 +53,10 @@ pub fn apply_hann_window(signal: &mut [Complex<f32>]) {
 /// within acceptable numerical precision
 pub fn test_roundtrip_accuracy(fft: &GpuFft, signal: &[Complex<f32>], epsilon: f32) {
     // FFT -> IFFT roundtrip
-    let spectrum = fft.fft(signal).expect("FFT failed");
-    let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
+    let spectrum_batch = fft.fft(&[signal.to_vec()]).expect("FFT failed");
+    let spectrum = &spectrum_batch[0];
+    let reconstructed_batch = fft.ifft(&[spectrum.to_vec()]).expect("IFFT failed");
+    let reconstructed = &reconstructed_batch[0];
 
     // Verify roundtrip accuracy
     assert_eq!(reconstructed.len(), signal.len());

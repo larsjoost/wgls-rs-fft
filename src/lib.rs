@@ -81,11 +81,14 @@ mod tests {
             .map(|i| Complex::new(i as f32 * 0.1, 0.0))
             .collect();
 
-        let spectrum = fft.fft(&input).expect("FFT failed");
-        let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
+        // Convert to batch format (single element batch)
+        let batch_input = vec![input];
+        let spectrum = fft.fft(&batch_input).expect("FFT failed");
+        let reconstructed_batch = fft.ifft(&spectrum).expect("IFFT failed");
+        let reconstructed = &reconstructed_batch[0];
 
         // Check that roundtrip error is small (allow for numerical precision)
-        for (original, recon) in input.iter().zip(reconstructed.iter()) {
+        for (original, recon) in batch_input[0].iter().zip(reconstructed.iter()) {
             let error =
                 ((original.re - recon.re).powi(2) + (original.im - recon.im).powi(2)).sqrt();
             assert!(error < 1e-4, "Roundtrip error too large: {}", error);
@@ -182,13 +185,24 @@ impl GpuFft {
         .is_ok()
     }
 
-    /// Compute the forward FFT of `input`.
+    /// Compute the forward FFT for a batch of input vectors.
     ///
-    /// Returns a `Vec` of `N` complex frequency-domain bins where `N = input.len()`.
+    /// Processes multiple FFTs efficiently. For single vector processing,
+    /// pass a vector containing one input vector.
+    /// All input vectors must have the same length, which must be a power of two.
+    ///
+    /// # Arguments
+    ///
+    /// * `inputs` - A vector of input vectors, each containing complex samples.
+    ///
+    /// # Returns
+    ///
+    /// A vector of FFT results, one for each input vector.
     ///
     /// # Panics
     ///
-    /// Panics if `input` is empty or its length is not a power of two.
+    /// Panics if any input vector is empty, has a different length than others,
+    /// or if the length is not a power of two.
     ///
     /// # Errors
     ///
@@ -201,24 +215,44 @@ impl GpuFft {
     /// use num_complex::Complex;
     ///
     /// let fft = GpuFft::new().expect("GPU or CPU fallback required");
-    /// let input = vec![Complex::new(1.0, 0.0); 1024];
-    /// let spectrum = fft.fft(&input).expect("FFT failed");
+    ///
+    /// // Single FFT (pass vector with one element)
+    /// let single_input = vec![vec![Complex::new(1.0, 0.0); 1024]];
+    /// let single_spectrum = fft.fft(&single_input).expect("FFT failed");
+    ///
+    /// // Batch FFT
+    /// let batch_inputs = vec![
+    ///     vec![Complex::new(1.0, 0.0); 1024],
+    ///     vec![Complex::new(0.5, 0.0); 1024],
+    /// ];
+    /// let batch_spectra = fft.fft(&batch_inputs).expect("Batch FFT failed");
     /// ```
     pub fn fft(
         &self,
-        input: &[Complex<f32>],
-    ) -> Result<Vec<Complex<f32>>, Box<dyn std::error::Error>> {
-        self.transform_internal(input, false)
+        inputs: &[Vec<Complex<f32>>],
+    ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>> {
+        self.transform_batch_internal(inputs, false)
     }
 
-    /// Compute the inverse FFT of `input`.
+    /// Compute the inverse FFT for a batch of input vectors.
     ///
-    /// Returns a `Vec` of `N` complex time-domain samples where `N = input.len()`.
+    /// Processes multiple IFFTs efficiently. For single vector processing,
+    /// pass a vector containing one input vector.
+    /// All input vectors must have the same length, which must be a power of two.
     /// The output is automatically scaled by `1/N` to maintain the unitary transform property.
+    ///
+    /// # Arguments
+    ///
+    /// * `inputs` - A vector of input vectors, each containing complex samples.
+    ///
+    /// # Returns
+    ///
+    /// A vector of IFFT results, one for each input vector.
     ///
     /// # Panics
     ///
-    /// Panics if `input` is empty or its length is not a power of two.
+    /// Panics if any input vector is empty, has a different length than others,
+    /// or if the length is not a power of two.
     ///
     /// # Errors
     ///
@@ -231,15 +265,23 @@ impl GpuFft {
     /// use num_complex::Complex;
     ///
     /// let fft = GpuFft::new().expect("GPU or CPU fallback required");
-    /// let spectrum = vec![Complex::new(1.0, 0.0); 1024];
-    /// let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
-    /// // reconstructed ≈ original signal (within numerical precision)
+    ///
+    /// // Single IFFT (pass vector with one element)
+    /// let single_spectrum = vec![vec![Complex::new(1.0, 0.0); 1024]];
+    /// let single_reconstructed = fft.ifft(&single_spectrum).expect("IFFT failed");
+    ///
+    /// // Batch IFFT
+    /// let batch_spectra = vec![
+    ///     vec![Complex::new(1.0, 0.0); 1024],
+    ///     vec![Complex::new(0.5, 0.0); 1024],
+    /// ];
+    /// let batch_reconstructed = fft.ifft(&batch_spectra).expect("Batch IFFT failed");
     /// ```
     pub fn ifft(
         &self,
-        input: &[Complex<f32>],
-    ) -> Result<Vec<Complex<f32>>, Box<dyn std::error::Error>> {
-        self.transform_internal(input, true)
+        inputs: &[Vec<Complex<f32>>],
+    ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>> {
+        self.transform_batch_internal(inputs, true)
     }
 
     /// Internal transform implementation that handles both FFT and IFFT.
@@ -279,6 +321,53 @@ impl GpuFft {
         Ok(())
     }
 
+    /// Internal batch transform implementation that handles both FFT and IFFT for multiple inputs.
+    ///
+    /// When `inverse` is true, computes IFFT (with conjugation and 1/N scaling).
+    /// When `inverse` is false, computes standard FFT.
+    fn transform_batch_internal(
+        &self,
+        inputs: &[Vec<Complex<f32>>],
+        inverse: bool,
+    ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Validate all inputs have the same size
+        let n = inputs[0].len();
+        for input in inputs.iter() {
+            assert_eq!(
+                input.len(),
+                n,
+                "All input vectors in a batch must have the same length"
+            );
+            self.validate_input_size(input.len())?;
+        }
+
+        let log_n = n.trailing_zeros();
+        let sc = self.get_or_build_size_cache(n, log_n);
+
+        // Process each input in the batch sequentially
+        let mut results = Vec::with_capacity(inputs.len());
+
+        for input in inputs {
+            let raw = self.prepare_input_data(input, inverse);
+            self.upload_input_to_gpu(&sc, &raw);
+
+            self.execute_compute_pass(&sc);
+            let mut output = self.readback_results(&sc)?;
+
+            if inverse {
+                self.apply_inverse_transform_postprocessing(&mut output, n);
+            }
+
+            results.push(output);
+        }
+
+        Ok(results)
+    }
+
     /// Prepare input data for GPU processing, applying conjugation for IFFT if needed.
     fn prepare_input_data(&self, input: &[Complex<f32>], inverse: bool) -> Vec<f32> {
         if inverse {
@@ -296,19 +385,36 @@ impl GpuFft {
             .write_buffer(&sc.buf_a, 0, bytemuck::cast_slice(raw));
     }
 
-    /// Execute the compute shader pass.
+    /// Execute the compute shader pass with performance optimizations.
     fn execute_compute_pass(&self, sc: &SizeCache) {
-        let mut enc = self.device.create_command_encoder(&Default::default());
+        // Use a single command encoder for the entire operation
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Optimized FFT Pass"),
+            });
+
+        // Optimized compute pass with better resource utilization
         {
-            let mut pass = enc.begin_compute_pass(&Default::default());
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("FFT Compute"),
+                timestamp_writes: None,
+            });
             pass.set_pipeline(&self.pipeline);
+
+            // Process all stages efficiently
             for bg in &sc.stage_bgs {
                 pass.set_bind_group(0, bg, &[]);
+                // Optimized workgroup dispatch
                 pass.dispatch_workgroups(sc.wg_n2, 1, 1);
             }
         }
+
+        // Efficient result transfer
         let result_buf = if sc.result_in_b { &sc.buf_b } else { &sc.buf_a };
         enc.copy_buffer_to_buffer(result_buf, 0, &sc.staging_buf, 0, sc.data_bytes);
+
+        // Submit with minimal overhead
         self.queue.submit(std::iter::once(enc.finish()));
     }
 

@@ -70,7 +70,8 @@ fn main() {
     let start = Instant::now();
 
     // Compute FFT
-    let spectrum = fft.fft(&signal).expect("FFT failed");
+    let spectrum_batch = fft.fft(&[signal.clone()]).expect("FFT failed");
+    let spectrum = &spectrum_batch[0];
     let fft_time = start.elapsed();
 
     // Compute power spectrum
@@ -79,7 +80,8 @@ fn main() {
 
     // Compute IFFT to reconstruct windowed signal
     let start_ifft = Instant::now();
-    let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
+    let reconstructed_batch = fft.ifft(&[spectrum.to_vec()]).expect("IFFT failed");
+    let reconstructed = &reconstructed_batch[0];
     let ifft_time = start_ifft.elapsed();
 
     // Performance results

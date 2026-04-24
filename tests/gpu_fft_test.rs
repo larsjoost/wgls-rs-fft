@@ -19,7 +19,9 @@ fn test_gpu_fft_matches_rustfft() {
     let input = make_input(N);
 
     let gpu = GpuFft::new().expect("GPU required");
-    let gpu_out = gpu.fft(&input).expect("GPU FFT failed");
+    let input_for_fft = input.clone();
+    let gpu_out_batch = gpu.fft(&[input_for_fft]).expect("GPU FFT failed");
+    let gpu_out = &gpu_out_batch[0];
 
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(N);

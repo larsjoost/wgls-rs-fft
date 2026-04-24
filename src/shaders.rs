@@ -7,7 +7,7 @@ use wgsl_rs::wgsl;
 /// dispatches. Output is in natural order; no bit-reversal pass is needed.
 ///
 /// Uniform U: .x = N, .y = stage index (0 … log₂N − 1).
-/// SRC / DST: interleaved complex pairs [re₀, im₀, re₁, im₁, …].
+/// SRC / DST:   interleaved complex pairs [re₀, im₀, re₁, im₁, …].
 /// TWIDDLE:   N/2 precomputed pairs [cos₀, sin₀, cos₁, sin₁, …] where
 ///            pair j = e^{-2πi·j/N}; accessed at index k*(N/2>>stage).
 #[wgsl]

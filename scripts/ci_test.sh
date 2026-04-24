@@ -50,10 +50,6 @@ fi
 
 # On Linux, check for GPU-related libraries
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    if ! ldconfig -p | grep -q libx11; then
-        echo "⚠️  libx11 not found. GPU tests may fail."
-        MISSING_DEPS=1
-    fi
     
     if ! ldconfig -p | grep -q libudev; then
         echo "⚠️  libudev not found. GPU tests may fail."
@@ -72,6 +68,8 @@ fi
 # Run cargo tests with single threading to avoid GPU resource contention
 section "Running cargo tests (single-threaded)"
 echo "Running: cargo test --verbose -- --test-threads=1"
+
+# Run all tests
 cargo test --verbose -- --test-threads=1
 TEST_RESULT=$?
 

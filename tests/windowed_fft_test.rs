@@ -29,10 +29,12 @@ fn test_window_function_properties() {
 
     // Apply window and compute FFT
     apply_hann_window(&mut signal);
-    let windowed_spectrum = fft.fft(&signal).expect("FFT failed");
+    let windowed_spectrum_batch = fft.fft(&[signal]).expect("FFT failed");
+    let windowed_spectrum = &windowed_spectrum_batch[0];
 
     // Compute FFT of original (unwindowed)
-    let original_spectrum = fft.fft(&original).expect("FFT failed");
+    let original_spectrum_batch = fft.fft(&[original]).expect("FFT failed");
+    let original_spectrum = &original_spectrum_batch[0];
 
     // Windowing should reduce spectral leakage
     // Check that windowed spectrum has lower side lobes
@@ -63,8 +65,10 @@ fn test_multiple_window_types() {
 
     // Test Hann window (already implemented)
     apply_hann_window(&mut signal);
-    let hann_spectrum = fft.fft(&signal).expect("FFT failed");
-    let hann_reconstructed = fft.ifft(&hann_spectrum).expect("IFFT failed");
+    let hann_spectrum_batch = fft.fft(&[signal.clone()]).expect("FFT failed");
+    let hann_spectrum = &hann_spectrum_batch[0];
+    let hann_reconstructed_batch = fft.ifft(&[hann_spectrum.to_vec()]).expect("IFFT failed");
+    let hann_reconstructed = &hann_reconstructed_batch[0];
 
     let mut max_error: f32 = 0.0;
     for (orig, recon) in signal.iter().zip(hann_reconstructed.iter()) {
@@ -84,7 +88,8 @@ fn test_frequency_detection() {
     apply_hann_window(&mut signal);
 
     // Compute FFT
-    let spectrum = fft.fft(&signal).expect("FFT failed");
+    let spectrum_batch = fft.fft(&[signal]).expect("FFT failed");
+    let spectrum = &spectrum_batch[0];
     let power_spectrum: Vec<f32> = spectrum.iter().map(|c| c.re * c.re + c.im * c.im).collect();
 
     // Find peaks in the spectrum

@@ -28,14 +28,14 @@ fn bench(fft: &GpuFft, n: usize, min_iters: usize, min_duration: Duration) -> Be
 
     // Warmup: let the GPU driver / shader JIT settle
     for _ in 0..5 {
-        fft.fft(&input).unwrap();
+        fft.fft(&[input.clone()]).unwrap();
     }
 
     // Measurement loop
     let mut iters = 0usize;
     let start = Instant::now();
     loop {
-        fft.fft(&input).unwrap();
+        fft.fft(&[input.clone()]).unwrap();
         iters += 1;
         if iters >= min_iters && start.elapsed() >= min_duration {
             break;

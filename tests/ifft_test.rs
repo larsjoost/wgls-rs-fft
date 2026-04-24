@@ -34,10 +34,12 @@ fn test_ifft_matches_rustfft() {
 
     // Create a time-domain signal and compute its FFT first
     let time_domain = make_test_signal(N);
-    let frequency_domain = fft.fft(&time_domain).expect("FFT failed");
+    let frequency_domain_batch = fft.fft(&[time_domain.clone()]).expect("FFT failed");
+    let frequency_domain = frequency_domain_batch[0].clone();
 
     // Compute IFFT with our implementation
-    let our_ifft = fft.ifft(&frequency_domain).expect("IFFT failed");
+    let our_ifft_batch = fft.ifft(&[frequency_domain]).expect("IFFT failed");
+    let our_ifft = &our_ifft_batch[0];
 
     // Compute forward FFT with rustfft for comparison (since our IFFT should reconstruct original)
     let mut planner = FftPlanner::<f32>::new();
@@ -78,8 +80,10 @@ fn test_fft_ifft_properties() {
     let input = make_test_signal(N);
 
     // FFT then IFFT should return scaled original
-    let spectrum = fft.fft(&input).expect("FFT failed");
-    let reconstructed = fft.ifft(&spectrum).expect("IFFT failed");
+    let spectrum_batch = fft.fft(&[input.clone()]).expect("FFT failed");
+    let spectrum = &spectrum_batch[0];
+    let reconstructed_batch = fft.ifft(&[spectrum.to_vec()]).expect("IFFT failed");
+    let reconstructed = &reconstructed_batch[0];
 
     // Check that FFT(IFFT(x)) = x and IFFT(FFT(x)) = x (within numerical precision)
     let mut max_diff: f32 = 0.0;
@@ -91,7 +95,8 @@ fn test_fft_ifft_properties() {
     assert!(max_diff < EPSILON);
 
     // Test that IFFT(FFT(x)) = x
-    let spectrum2 = fft.fft(&reconstructed).expect("FFT failed");
+    let spectrum2_batch = fft.fft(&[reconstructed.to_vec()]).expect("FFT failed");
+    let spectrum2 = &spectrum2_batch[0];
     let mut max_diff2: f32 = 0.0;
     for (s1, s2) in spectrum.iter().zip(spectrum2.iter()) {
         let diff = ((s1.re - s2.re).powi(2) + (s1.im - s2.im).powi(2)).sqrt();
