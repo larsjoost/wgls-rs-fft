@@ -9,6 +9,12 @@ use std::num::NonZeroU64;
 
 use num_complex::Complex;
 
+pub mod benchmark;
+#[cfg(feature = "cuda")]
+mod cufft_wrapper;
+pub mod rivals;
+#[cfg(feature = "rocm")]
+mod rocfft_wrapper;
 mod shaders;
 
 /// GPU-accelerated FFT executor.
@@ -17,11 +23,44 @@ mod shaders;
 /// Falls back to CPU-based software rendering when no GPU is available.
 use std::cell::RefCell;
 
+/// Trait for FFT implementations that can be benchmarked.
+pub trait FftExecutor {
+    fn name(&self) -> &str;
+    fn fft(
+        &self,
+        inputs: &[Vec<Complex<f32>>],
+    ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>>;
+    fn ifft(
+        &self,
+        inputs: &[Vec<Complex<f32>>],
+    ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>>;
+}
+
 pub struct GpuFft {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     cache: RefCell<std::collections::HashMap<usize, SizeCache>>,
+}
+
+impl FftExecutor for GpuFft {
+    fn name(&self) -> &str {
+        "Baseline (Stockham Radix-2)"
+    }
+
+    fn fft(
+        &self,
+        inputs: &[Vec<Complex<f32>>],
+    ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>> {
+        self.transform_batch_internal(inputs, false)
+    }
+
+    fn ifft(
+        &self,
+        inputs: &[Vec<Complex<f32>>],
+    ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>> {
+        self.transform_batch_internal(inputs, true)
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +143,7 @@ struct SizeCache {
     staging_buf: wgpu::Buffer,
     #[allow(dead_code)] // Used in shader but not directly accessed in Rust code
     twiddle_buf: wgpu::Buffer,
+    #[allow(dead_code)] // Kept for potential future use
     data_bytes: u64,
     stage_bgs: Vec<wgpu::BindGroup>,
     result_in_b: bool,
@@ -135,11 +175,23 @@ impl GpuFft {
     /// // Now use fft.fft() and fft.ifft()
     /// ```
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_shader(
+            shaders::stockham::WGSL_MODULE.wgsl_source().join("\n"),
+            "stockham_baseline",
+        )
+    }
+
+    /// Create a new [`GpuFft`] with a custom WGSL shader.
+    /// This allows AI rivals to swap kernels easily.
+    pub fn with_shader(
+        wgsl_source: String,
+        label: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
-            force_fallback_adapter: true, // Enable CPU fallback when no GPU available
+            force_fallback_adapter: true,
         }))?;
 
         let (device, queue) =
@@ -148,17 +200,12 @@ impl GpuFft {
             }))?;
 
         let shader_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("stockham"),
-            source: wgpu::ShaderSource::Wgsl(
-                shaders::stockham::WGSL_MODULE
-                    .wgsl_source()
-                    .join("\n")
-                    .into(),
-            ),
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(wgsl_source.into()),
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("stockham_pipeline"),
+            label: Some(&format!("{}_pipeline", label)),
             layout: None,
             module: &shader_mod,
             entry_point: Some("main"),
@@ -293,23 +340,10 @@ impl GpuFft {
         input: &[Complex<f32>],
         inverse: bool,
     ) -> Result<Vec<Complex<f32>>, Box<dyn std::error::Error>> {
-        let n = input.len();
-        self.validate_input_size(n)?;
-
-        let log_n = n.trailing_zeros();
-        let sc = self.get_or_build_size_cache(n, log_n);
-
-        let raw = self.prepare_input_data(input, inverse);
-        self.upload_input_to_gpu(&sc, &raw);
-
-        self.execute_compute_pass(&sc);
-        let mut output = self.readback_results(&sc)?;
-
-        if inverse {
-            self.apply_inverse_transform_postprocessing(&mut output, n);
-        }
-
-        Ok(output)
+        // Use batch processing even for single FFT for consistency
+        let batch_input = vec![input.to_vec()];
+        let batch_result = self.transform_batch_internal(&batch_input, inverse)?;
+        Ok(batch_result.into_iter().next().unwrap())
     }
 
     /// Validate that the input size is a power of two and non-zero.
@@ -346,24 +380,36 @@ impl GpuFft {
         }
 
         let log_n = n.trailing_zeros();
+        let batch_size = inputs.len() as u32;
         let sc = self.get_or_build_size_cache(n, log_n);
 
-        // Process each input in the batch sequentially
-        let mut results = Vec::with_capacity(inputs.len());
-
+        // Prepare all input data for parallel processing
+        let mut all_raw_data = Vec::with_capacity((n * 2 * batch_size as usize) as usize);
         for input in inputs {
             let raw = self.prepare_input_data(input, inverse);
-            self.upload_input_to_gpu(&sc, &raw);
-
-            self.execute_compute_pass(&sc);
-            let mut output = self.readback_results(&sc)?;
-
-            if inverse {
-                self.apply_inverse_transform_postprocessing(&mut output, n);
-            }
-
-            results.push(output);
+            all_raw_data.extend_from_slice(&raw);
         }
+
+        // Upload entire batch to GPU
+        self.queue
+            .write_buffer(&sc.buf_a, 0, bytemuck::cast_slice(&all_raw_data));
+
+        // Execute compute pass for the entire batch
+        self.execute_compute_pass(&sc, batch_size, n);
+
+        // Read back all results
+        let mut output = self.readback_results(&sc, batch_size)?;
+
+        // Apply post-processing for inverse transforms
+        if inverse {
+            for chunk in output.chunks_mut(n) {
+                self.apply_inverse_transform_postprocessing(chunk, n);
+            }
+        }
+
+        // Split into individual results
+        let results: Vec<Vec<Complex<f32>>> =
+            output.chunks(n).map(|chunk| chunk.to_vec()).collect();
 
         Ok(results)
     }
@@ -379,14 +425,8 @@ impl GpuFft {
         }
     }
 
-    /// Upload input data to GPU buffer.
-    fn upload_input_to_gpu(&self, sc: &SizeCache, raw: &[f32]) {
-        self.queue
-            .write_buffer(&sc.buf_a, 0, bytemuck::cast_slice(raw));
-    }
-
     /// Execute the compute shader pass with performance optimizations.
-    fn execute_compute_pass(&self, sc: &SizeCache) {
+    fn execute_compute_pass(&self, sc: &SizeCache, batch_size: u32, n: usize) {
         // Use a single command encoder for the entire operation
         let mut enc = self
             .device
@@ -405,14 +445,21 @@ impl GpuFft {
             // Process all stages efficiently
             for bg in &sc.stage_bgs {
                 pass.set_bind_group(0, bg, &[]);
-                // Optimized workgroup dispatch
-                pass.dispatch_workgroups(sc.wg_n2, 1, 1);
+                // Optimized workgroup dispatch with batch dimension
+                pass.dispatch_workgroups(sc.wg_n2, batch_size, 1);
             }
         }
 
         // Efficient result transfer
         let result_buf = if sc.result_in_b { &sc.buf_b } else { &sc.buf_a };
-        enc.copy_buffer_to_buffer(result_buf, 0, &sc.staging_buf, 0, sc.data_bytes);
+        let single_fft_bytes = (n * 2 * std::mem::size_of::<f32>()) as u64;
+        enc.copy_buffer_to_buffer(
+            result_buf,
+            0,
+            &sc.staging_buf,
+            0,
+            single_fft_bytes * batch_size as u64,
+        );
 
         // Submit with minimal overhead
         self.queue.submit(std::iter::once(enc.finish()));
@@ -422,6 +469,7 @@ impl GpuFft {
     fn readback_results(
         &self,
         sc: &SizeCache,
+        _batch_size: u32,
     ) -> Result<Vec<Complex<f32>>, Box<dyn std::error::Error>> {
         // Readback
         let slice = sc.staging_buf.slice(..);
@@ -469,7 +517,11 @@ impl GpuFft {
 
     /// Build GPU buffers and bind groups for a specific FFT size.
     fn build_size_cache(&self, n: usize, log_n: u32) -> SizeCache {
-        let data_bytes = (n * 2 * std::mem::size_of::<f32>()) as u64;
+        let single_fft_bytes = (n * 2 * std::mem::size_of::<f32>()) as u64;
+        let max_batch_size = (self.device.limits().max_storage_buffer_binding_size as u64
+            / single_fft_bytes)
+            .min(1024) as u32;
+        let data_bytes = single_fft_bytes * max_batch_size as u64;
 
         let make_buf = |label| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -596,3 +648,8 @@ impl Default for GpuFft {
         Self::new().expect("No GPU available for default GpuFft instance")
     }
 }
+
+#[cfg(feature = "cuda")]
+pub use cufft_wrapper::CuFft;
+#[cfg(feature = "rocm")]
+pub use rocfft_wrapper::RocFft;

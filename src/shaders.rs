@@ -20,9 +20,10 @@ pub mod stockham {
     storage!(group(0), binding(3), TWIDDLE: RuntimeArray<f32>);
 
     #[compute]
-    #[workgroup_size(256)]
+    #[workgroup_size(256, 1, 1)]
     pub fn main(#[builtin(global_invocation_id)] gid: Vec3u) {
         let tid = gid.x;
+        let batch_id = gid.y;
         let n = get!(U).x;
         let half_n = n >> 1u32;
         if tid >= half_n {
@@ -36,19 +37,25 @@ pub mod stockham {
         let k = tid % p;
         let j = tid / p;
 
+        // Calculate base offset for this batch element
+        let batch_offset = batch_id * n * 2u32;
+
         // Source: natural-order read (Stockham DIT).
         let i1 = j * p + k;
         let i2 = i1 + half_n;
 
-        let re1 = get!(SRC)[2 * i1];
-        let im1 = get!(SRC)[2 * i1 + 1];
-        let re2 = get!(SRC)[2 * i2];
-        let im2 = get!(SRC)[2 * i2 + 1];
+        let src_offset1 = batch_offset + 2u32 * i1;
+        let src_offset2 = batch_offset + 2u32 * i2;
+
+        let re1 = get!(SRC)[src_offset1];
+        let im1 = get!(SRC)[src_offset1 + 1u32];
+        let re2 = get!(SRC)[src_offset2];
+        let im2 = get!(SRC)[src_offset2 + 1u32];
 
         // Twiddle lookup: index = k * (half_n / p) = k * (half_n >> stage).
         let twiddle_idx = k * (half_n >> stage);
-        let wr = get!(TWIDDLE)[2 * twiddle_idx];
-        let wi = get!(TWIDDLE)[2 * twiddle_idx + 1];
+        let wr = get!(TWIDDLE)[2u32 * twiddle_idx];
+        let wi = get!(TWIDDLE)[2u32 * twiddle_idx + 1u32];
 
         let tr = wr * re2 - wi * im2;
         let ti = wr * im2 + wi * re2;
@@ -57,9 +64,12 @@ pub mod stockham {
         let out1 = j * two_p + k;
         let out2 = out1 + p;
 
-        get_mut!(DST)[2 * out1] = re1 + tr;
-        get_mut!(DST)[2 * out1 + 1] = im1 + ti;
-        get_mut!(DST)[2 * out2] = re1 - tr;
-        get_mut!(DST)[2 * out2 + 1] = im1 - ti;
+        let dst_offset1 = batch_offset + 2u32 * out1;
+        let dst_offset2 = batch_offset + 2u32 * out2;
+
+        get_mut!(DST)[dst_offset1] = re1 + tr;
+        get_mut!(DST)[dst_offset1 + 1u32] = im1 + ti;
+        get_mut!(DST)[dst_offset2] = re1 - tr;
+        get_mut!(DST)[dst_offset2 + 1u32] = im1 - ti;
     }
 }
