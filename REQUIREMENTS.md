@@ -1,5 +1,12 @@
 # Requirements: 1D Batched WebGPU FFT (High-Performance)
 
+## 0. Execution Mode and Benchmark Validity (Mandatory)
+
+* **Prefer real GPU adapters:** Request adapter with `force_fallback_adapter: false` first. If unavailable, then fall back to `true`.
+* **Report adapter info:** Print backend + adapter name in benchmark output so software fallback runs are obvious.
+* **Release-only performance runs:** All leaderboard/performance numbers must be collected with `--release`.
+* **Separate timing from readback:** Timed benchmark path must not include host readback (`map_async`, staging-buffer map, CPU polling for result extraction). Readback is only for correctness validation.
+
 ## 1. Batch-Aware Memory Architecture
 
 * **Contiguous Layout:** Input must be a single `wgpu::Buffer` containing B signals of length N.
@@ -13,6 +20,7 @@ The planner must choose a dispatch strategy based on the relationship between FF
 ### Strategy A: Small FFTs (One or More per Workgroup)
 * **Occupancy Focus:** If N is small (e.g., 64, 128, 256), a single workgroup should process **multiple** FFTs from the batch.
 * **Shared Memory Tiling:** Use `var<workgroup>` memory as a staging area where multiple signals are loaded, processed, and written back in bulk.
+* **Single-dispatch local FFT for small N:** For `N <= 256`, perform the full FFT in workgroup memory in one dispatch (no global ping-pong passes).
 * **Why:** Prevents under-utilization where a workgroup has 256 threads but only 64 are doing work.
 
 ### Strategy B: Medium FFTs (One per Workgroup)
@@ -37,10 +45,18 @@ The planner must choose a dispatch strategy based on the relationship between FF
 
 ## 5. Performance Monitoring
 
-* **Timestamp Queries:** Use `wgpu::QuerySet` with `wgpu::Features::TIMESTAMP_QUERY` (must be explicitly requested) to measure GPU time per batch.
+* **Timestamp Queries (required):** Use `wgpu::QuerySet` with `wgpu::Features::TIMESTAMP_QUERY` (must be explicitly requested) to measure GPU kernel time.
+* **Timing scope:** Report GPU-only time (dispatch execution), not wall-clock host orchestration/readback time.
 * **Throughput Calculation:** Report performance as **GFLOPS** using the standard FFT operation count: `5 · B · N · log₂N / time`.
 * **Alignment:** Use `bytemuck` (already a project dependency) to cast buffer data. Uniform buffer offsets must respect `device.limits().min_uniform_buffer_offset_alignment` — the baseline already handles this.
 
+## 6. Validation and Benchmark API Shape
+
+* **Two-path execution model:** Implement:
+  1. **Benchmark path:** upload + dispatch + timestamp resolve, no host decode of FFT outputs.
+  2. **Validation path:** run FFT once, read back results, compare to baseline within tolerance.
+* **Correctness is unchanged:** Validation still compares rival output vs baseline output sample-by-sample under the existing tolerance.
+
 ## Summary
 
-> Implement a **1D Batched FFT** in WebGPU/Rust. Focus on a **Stockham-based Mixed-Radix** approach. For small N, pack multiple signals into a single workgroup. For large N, use multi-pass kernels (one `dispatch_workgroups` call per pass). Use **subgroup shuffles** where the `SUBGROUP` feature is available, falling back to `workgroupBarrier`. Data is interleaved `vec2<f32>`. The goal is maximum VRAM throughput and occupancy.
+> Implement a **1D Batched FFT** in WebGPU/Rust. Focus on a **Stockham-based Mixed-Radix** approach with an explicit small-FFT local-memory path. Benchmark on real GPU adapters when available, in **release mode**, and measure **GPU-only execution time** (separate from readback). Use subgroup shuffles where available, with workgroup fallbacks. Data is interleaved `vec2<f32>`. The goal is maximum VRAM throughput and occupancy.

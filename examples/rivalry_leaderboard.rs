@@ -1,5 +1,5 @@
 use wgls_rs_fft::{
-    benchmark::{sweep_rival, ValidationOutcome},
+    benchmark::{benchmark_rival, ValidationOutcome, MAX_TOTAL_SAMPLES},
     FftExecutor, GpuFft,
 };
 
@@ -16,6 +16,7 @@ fn main() {
     rivals.push(Box::new(GpuFft::new().expect("Failed to init WebGPU")));
     rivals.push(Box::new(wgls_rs_fft::rivals::radix4::Radix4Rival::new()));
     rivals.push(Box::new(wgls_rs_fft::rivals::claude::ClaudeFft::new()));
+    rivals.push(Box::new(wgls_rs_fft::rivals::codex::CodexFft::new()));
     rivals.push(Box::new(wgls_rs_fft::rivals::gemini::GeminiFft::new()));
     rivals.push(Box::new(
         wgls_rs_fft::rivals::mistral_vibe::MistralVibeFft::new(),
@@ -27,9 +28,9 @@ fn main() {
     }
 
     let fft_sizes = [256, 1024, 16384, 65536, 1048576];
-    let batch_sizes = [1, 16, 64, 256, 1024];
 
     for &n in &fft_sizes {
+        let batch_size = choose_batch_size(n);
         println!("\n--- N = {} ---", n);
         println!(
             "{:>32} | {:>8} | {:>14} | {:>10} | {:>8}",
@@ -38,7 +39,7 @@ fn main() {
         println!("{}", "-".repeat(84));
 
         for rival in &rivals {
-            let result = sweep_rival(rival.as_ref(), &reference, n, &batch_sizes);
+            let result = benchmark_rival(rival.as_ref(), &reference, n, batch_size);
             let status = match &result.validation {
                 ValidationOutcome::Pass => "PASS".to_string(),
                 ValidationOutcome::Fail { max_error } => format!("FAIL({:.2e})", max_error),
@@ -55,4 +56,24 @@ fn main() {
     }
 
     println!("\nAdd your implementation to src/rivals/ and register it above to compete.");
+}
+
+fn choose_batch_size(n: usize) -> usize {
+    let preferred = if n <= 1024 {
+        1024
+    } else if n <= 16384 {
+        256
+    } else if n <= 65536 {
+        64
+    } else if n <= 262_144 {
+        16
+    } else {
+        1
+    };
+
+    let mut batch = preferred;
+    while n.saturating_mul(batch) > MAX_TOTAL_SAMPLES && batch > 1 {
+        batch /= 2;
+    }
+    batch.max(1)
 }

@@ -7,6 +7,7 @@
 
 pub mod baseline;
 pub mod claude;
+pub mod codex;
 pub mod gemini;
 pub mod mistral_vibe;
 pub mod radix4;
