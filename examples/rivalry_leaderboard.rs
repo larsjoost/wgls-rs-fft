@@ -16,6 +16,10 @@ fn main() {
     rivals.push(Box::new(GpuFft::new().expect("Failed to init WebGPU")));
     rivals.push(Box::new(wgls_rs_fft::rivals::radix4::Radix4Rival::new()));
     rivals.push(Box::new(wgls_rs_fft::rivals::claude::ClaudeFft::new()));
+    rivals.push(Box::new(wgls_rs_fft::rivals::gemini::GeminiFft::new()));
+    rivals.push(Box::new(
+        wgls_rs_fft::rivals::mistral_vibe::MistralVibeFft::new(),
+    ));
 
     #[cfg(feature = "cuda")]
     if let Ok(cufft) = CuFft::new(1024) {

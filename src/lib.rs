@@ -398,7 +398,7 @@ impl GpuFft {
         self.execute_compute_pass(&sc, batch_size, n);
 
         // Read back all results
-        let mut output = self.readback_results(&sc, batch_size)?;
+        let mut output = self.readback_results(&sc, batch_size, n)?;
 
         // Apply post-processing for inverse transforms
         if inverse {
@@ -469,10 +469,13 @@ impl GpuFft {
     fn readback_results(
         &self,
         sc: &SizeCache,
-        _batch_size: u32,
+        batch_size: u32,
+        n: usize,
     ) -> Result<Vec<Complex<f32>>, Box<dyn std::error::Error>> {
         // Readback
-        let slice = sc.staging_buf.slice(..);
+        let single_fft_bytes = (n * 2 * std::mem::size_of::<f32>()) as u64;
+        let total_bytes = single_fft_bytes * batch_size as u64;
+        let slice = sc.staging_buf.slice(0..total_bytes);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::PollType::Wait {
             submission_index: None,
