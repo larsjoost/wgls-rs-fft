@@ -1,0 +1,43 @@
+# Dockerfile for FFT Rivalry Leaderboard with CUDA support
+# Build with: docker build -t fft-rivalry-leaderboard -f scripts/Dockerfile.cuda .
+
+FROM docker.io/nvidia/cuda:11.8.0-devel-ubuntu22.04
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    cmake \
+    git \
+    libx11-dev \
+    libasound2-dev \
+    libudev-dev \
+    libwayland-dev \
+    libxkbcommon-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH "/root/.cargo/bin:${PATH}"
+
+# Set up CUDA environment
+ENV CUDA_HOME /usr/local/cuda
+ENV LD_LIBRARY_PATH /usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+ENV PATH /usr/local/cuda/bin:${PATH}
+
+# Verify CUDA toolchain (build stage has no guaranteed GPU device access)
+RUN nvcc --version
+
+# Set working directory
+WORKDIR /app
+
+# Copy project files
+COPY . .
+
+# Build the project with CUDA features
+RUN cargo build --release --features cuda
+
+# Set default command
+CMD ["cargo", "run", "--example", "rivalry_leaderboard", "--release", "--features", "cuda"]

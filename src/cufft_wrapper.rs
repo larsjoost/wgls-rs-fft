@@ -1,12 +1,15 @@
 use crate::FftExecutor;
-use cufft_rust::*;
+use cudarc::cufft::{sys, CudaFft, FftDirection};
+use cudarc::driver::{CudaContext, CudaStream};
 use num_complex::Complex;
 use std::error::Error;
+use std::io::{Error as IoError, ErrorKind};
+use std::sync::Arc;
 
-/// Wrapper for cuFFT to compare performance with our WebGPU implementation
+/// Wrapper for cuFFT (via cudarc) to compare performance with our WebGPU implementation.
 pub struct CuFft {
-    plan: CufftPlan,
-    stream: CudaStream,
+    plan: CudaFft,
+    stream: Arc<CudaStream>,
     fft_size: usize,
 }
 
@@ -20,62 +23,25 @@ impl FftExecutor for CuFft {
     }
 
     fn ifft(&self, inputs: &[Vec<Complex<f32>>]) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn Error>> {
-        // IFFT needs to be handled via batch if we want to support it properly in the trait
-        if inputs.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let n = inputs[0].len();
-        let batch_size = inputs.len();
-
-        // Flatten input data
-        let flat_input: Vec<Complex<f32>> = inputs.iter().flat_map(|v| v.iter().cloned()).collect();
-
-        // Create device buffers
-        let mut d_input = CudaDeviceMemory::new(&flat_input)?;
-        let mut d_output = CudaDeviceMemory::new_empty::<Complex<f32>>(n * batch_size)?;
-
-        // Create batch plan
-        let mut batch_plan = CufftPlan::new()?;
-        batch_plan.set_stream(self.stream.handle())?;
-        batch_plan.create_1d(n as i32, CufftType::C2C, batch_size as i32)?;
-
-        // Execute batch FFT
-        batch_plan.execute_c2c(&mut d_input, &mut d_output, CufftDirection::Inverse)?;
-
-        // Copy result back to host
-        let mut flat_result = vec![Complex::new(0.0, 0.0); n * batch_size];
-        d_output.copy_to_host(&mut flat_result)?;
-
-        // Split into individual results and scale
-        let scale = 1.0 / n as f32;
-        let result: Vec<Vec<Complex<f32>>> = flat_result
-            .chunks(n)
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .map(|c| Complex::new(c.re * scale, c.im * scale))
-                    .collect()
-            })
-            .collect();
-
-        Ok(result)
+        self.batch_ifft(inputs)
     }
 }
 
 impl CuFft {
-    /// Create a new cuFFT instance
+    /// Create a new cuFFT instance.
     pub fn new(fft_size: usize) -> Result<Self, Box<dyn Error>> {
-        // Initialize CUDA
-        cufft_rust::init()?;
+        if fft_size == 0 {
+            return Err(IoError::new(ErrorKind::InvalidInput, "fft_size must be > 0").into());
+        }
 
-        // Create a stream
-        let stream = CudaStream::new()?;
-
-        // Create FFT plan
-        let mut plan = CufftPlan::new()?;
-        plan.set_stream(stream.handle())?;
-        plan.create_1d(fft_size as i32, CufftType::C2C, 1)?;
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let plan = CudaFft::plan_1d(
+            fft_size as i32,
+            sys::cufftType::CUFFT_C2C,
+            1,
+            stream.clone(),
+        )?;
 
         Ok(Self {
             plan,
@@ -84,51 +50,103 @@ impl CuFft {
         })
     }
 
-    /// Perform forward FFT
-    pub fn fft(&self, input: &[Complex<f32>]) -> Result<Vec<Complex<f32>>, Box<dyn Error>> {
-        let n = input.len();
-
-        // Create device buffers
-        let mut d_input = CudaDeviceMemory::new(input)?;
-        let mut d_output = CudaDeviceMemory::new_empty::<Complex<f32>>(n)?;
-
-        // Execute FFT
-        self.plan
-            .execute_c2c(&mut d_input, &mut d_output, CufftDirection::Forward)?;
-
-        // Copy result back to host
-        let mut result = vec![Complex::new(0.0, 0.0); n];
-        d_output.copy_to_host(&mut result)?;
-
-        Ok(result)
+    fn ensure_input_size(&self, input: &[Complex<f32>]) -> Result<(), Box<dyn Error>> {
+        if input.len() != self.fft_size {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "input length {} does not match planned fft_size {}",
+                    input.len(),
+                    self.fft_size
+                ),
+            )
+            .into());
+        }
+        Ok(())
     }
 
-    /// Perform inverse FFT
-    pub fn ifft(&self, input: &[Complex<f32>]) -> Result<Vec<Complex<f32>>, Box<dyn Error>> {
-        let n = input.len();
-
-        // Create device buffers
-        let mut d_input = CudaDeviceMemory::new(input)?;
-        let mut d_output = CudaDeviceMemory::new_empty::<Complex<f32>>(n)?;
-
-        // Execute inverse FFT
-        self.plan
-            .execute_c2c(&mut d_input, &mut d_output, CufftDirection::Inverse)?;
-
-        // Copy result back to host and scale
-        let mut result = vec![Complex::new(0.0, 0.0); n];
-        d_output.copy_to_host(&mut result)?;
-
-        // Scale by 1/N for inverse FFT
-        let scale = 1.0 / n as f32;
-        for c in &mut result {
-            *c = Complex::new(c.re * scale, c.im * scale);
+    fn validate_batch_inputs(inputs: &[Vec<Complex<f32>>]) -> Result<usize, Box<dyn Error>> {
+        if inputs.is_empty() {
+            return Ok(0);
         }
 
+        let n = inputs[0].len();
+        if n == 0 {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "batch input vectors must be non-empty",
+            )
+            .into());
+        }
+
+        for (idx, input) in inputs.iter().enumerate() {
+            if input.len() != n {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "all batch inputs must have the same length; input[0]={n}, input[{idx}]={}",
+                        input.len()
+                    ),
+                )
+                .into());
+            }
+        }
+
+        Ok(n)
+    }
+
+    fn to_cuda_complex(values: &[Complex<f32>]) -> Vec<sys::float2> {
+        values
+            .iter()
+            .map(|c| sys::float2 { x: c.re, y: c.im })
+            .collect()
+    }
+
+    fn from_cuda_complex(values: &[sys::float2]) -> Vec<Complex<f32>> {
+        values.iter().map(|c| Complex::new(c.x, c.y)).collect()
+    }
+
+    fn scale_inverse(output: &mut [Complex<f32>], n: usize) {
+        let scale = 1.0 / n as f32;
+        for c in output {
+            c.re *= scale;
+            c.im *= scale;
+        }
+    }
+
+    /// Perform forward FFT.
+    pub fn fft(&self, input: &[Complex<f32>]) -> Result<Vec<Complex<f32>>, Box<dyn Error>> {
+        self.ensure_input_size(input)?;
+
+        let host_input = Self::to_cuda_complex(input);
+        let mut d_input = self.stream.clone_htod(&host_input)?;
+        let mut d_output = self.stream.alloc_zeros::<sys::float2>(self.fft_size)?;
+
+        self.plan
+            .exec_c2c(&mut d_input, &mut d_output, FftDirection::Forward)?;
+
+        let host_output: Vec<sys::float2> = self.stream.clone_dtoh(&d_output)?;
+        Ok(Self::from_cuda_complex(&host_output))
+    }
+
+    /// Perform inverse FFT.
+    pub fn ifft(&self, input: &[Complex<f32>]) -> Result<Vec<Complex<f32>>, Box<dyn Error>> {
+        self.ensure_input_size(input)?;
+
+        let host_input = Self::to_cuda_complex(input);
+        let mut d_input = self.stream.clone_htod(&host_input)?;
+        let mut d_output = self.stream.alloc_zeros::<sys::float2>(self.fft_size)?;
+
+        self.plan
+            .exec_c2c(&mut d_input, &mut d_output, FftDirection::Inverse)?;
+
+        let host_output: Vec<sys::float2> = self.stream.clone_dtoh(&d_output)?;
+        let mut result = Self::from_cuda_complex(&host_output);
+        Self::scale_inverse(&mut result, self.fft_size);
         Ok(result)
     }
 
-    /// Perform batch FFT
+    /// Perform batch FFT.
     pub fn batch_fft(
         &self,
         inputs: &[Vec<Complex<f32>>],
@@ -137,43 +155,72 @@ impl CuFft {
             return Ok(Vec::new());
         }
 
-        let n = inputs[0].len();
+        let n = Self::validate_batch_inputs(inputs)?;
         let batch_size = inputs.len();
 
-        // Flatten input data
-        let flat_input: Vec<Complex<f32>> = inputs.iter().flat_map(|v| v.iter().cloned()).collect();
+        let flat_input: Vec<sys::float2> = inputs
+            .iter()
+            .flat_map(|v| v.iter().map(|c| sys::float2 { x: c.re, y: c.im }))
+            .collect();
 
-        // Create device buffers
-        let mut d_input = CudaDeviceMemory::new(&flat_input)?;
-        let mut d_output = CudaDeviceMemory::new_empty::<Complex<f32>>(n * batch_size)?;
+        let mut d_input = self.stream.clone_htod(&flat_input)?;
+        let mut d_output = self.stream.alloc_zeros::<sys::float2>(n * batch_size)?;
 
-        // Create batch plan
-        let mut batch_plan = CufftPlan::new()?;
-        batch_plan.set_stream(self.stream.handle())?;
-        batch_plan.create_1d(n as i32, CufftType::C2C, batch_size as i32)?;
+        let plan = CudaFft::plan_1d(
+            n as i32,
+            sys::cufftType::CUFFT_C2C,
+            batch_size as i32,
+            self.stream.clone(),
+        )?;
+        plan.exec_c2c(&mut d_input, &mut d_output, FftDirection::Forward)?;
 
-        // Execute batch FFT
-        batch_plan.execute_c2c(&mut d_input, &mut d_output, CufftDirection::Forward)?;
-
-        // Copy result back to host
-        let mut flat_result = vec![Complex::new(0.0, 0.0); n * batch_size];
-        d_output.copy_to_host(&mut flat_result)?;
-
-        // Split into individual results
-        let result: Vec<Vec<Complex<f32>>> =
-            flat_result.chunks(n).map(|chunk| chunk.to_vec()).collect();
+        let flat_output: Vec<sys::float2> = self.stream.clone_dtoh(&d_output)?;
+        let result = flat_output.chunks(n).map(Self::from_cuda_complex).collect();
 
         Ok(result)
     }
 
-    /// Check if CUDA is available
-    pub fn is_available() -> bool {
-        cufft_rust::init().is_ok()
-    }
-}
+    fn batch_ifft(
+        &self,
+        inputs: &[Vec<Complex<f32>>],
+    ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn Error>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
 
-impl Drop for CuFft {
-    fn drop(&mut self) {
-        // Cleanup is handled automatically by cufft_rust
+        let n = Self::validate_batch_inputs(inputs)?;
+        let batch_size = inputs.len();
+
+        let flat_input: Vec<sys::float2> = inputs
+            .iter()
+            .flat_map(|v| v.iter().map(|c| sys::float2 { x: c.re, y: c.im }))
+            .collect();
+
+        let mut d_input = self.stream.clone_htod(&flat_input)?;
+        let mut d_output = self.stream.alloc_zeros::<sys::float2>(n * batch_size)?;
+
+        let plan = CudaFft::plan_1d(
+            n as i32,
+            sys::cufftType::CUFFT_C2C,
+            batch_size as i32,
+            self.stream.clone(),
+        )?;
+        plan.exec_c2c(&mut d_input, &mut d_output, FftDirection::Inverse)?;
+
+        let flat_output: Vec<sys::float2> = self.stream.clone_dtoh(&d_output)?;
+
+        let mut result: Vec<Vec<Complex<f32>>> =
+            flat_output.chunks(n).map(Self::from_cuda_complex).collect();
+
+        for values in &mut result {
+            Self::scale_inverse(values, n);
+        }
+
+        Ok(result)
+    }
+
+    /// Check if CUDA is available.
+    pub fn is_available() -> bool {
+        Self::new(16).is_ok()
     }
 }

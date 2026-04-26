@@ -17,79 +17,100 @@ pub mod radix4_kernel {
         let tid = gid.x;
         let batch_id = gid.y;
         let n = get!(U).x;
-        let half_n = n >> 1u32;
-        if tid >= half_n {
+        let stage = get!(U).y;
+        let batch_offset = batch_id * n * 2u32;
+
+        // For Radix-4, we only process even stages (0, 2, 4, ...)
+        // Odd stages (1, 3, 5, ...) are identity operations (copy SRC to DST)
+        if stage % 2u32 != 0u32 {
+            // Each thread in a radix-2 dispatch processes 2 elements normally.
+            // Since we are dispatched with n/2 threads, each thread can copy 2 complex numbers (4 floats).
+            let idx1 = tid;
+            let idx2 = tid + (n >> 1u32);
+
+            if idx1 < n {
+                let s1 = batch_offset + 2u32 * idx1;
+                get_mut!(DST)[s1] = get!(SRC)[s1];
+                get_mut!(DST)[s1 + 1u32] = get!(SRC)[s1 + 1u32];
+            }
+            if idx2 < n {
+                let s2 = batch_offset + 2u32 * idx2;
+                get_mut!(DST)[s2] = get!(SRC)[s2];
+                get_mut!(DST)[s2 + 1u32] = get!(SRC)[s2 + 1u32];
+            }
             return;
         }
 
-        let stage = get!(U).y;
-        let p = 1u32 << stage;
-        let two_p = p + p;
-        let three_p = two_p + p;
-        let four_p = two_p + two_p;
+        let quarter_n = n >> 2u32;
+        if tid >= quarter_n {
+            return;
+        }
+
+        let r4_stage = stage / 2u32;
+
+        let p = 1u32 << (r4_stage + r4_stage);
+        let four_p = p << 2u32;
 
         let k = tid % p;
         let j = tid / p;
 
-        // Calculate base offset for this batch element
-        let batch_offset = batch_id * n * 2u32;
-
         // Source: natural-order read (Stockham DIT).
-        let i1 = j * four_p + k;
-        let i2 = i1 + p;
-        let i3 = i1 + two_p;
-        let i4 = i1 + three_p;
+        let i0 = j * p + k;
+        let i1 = i0 + quarter_n;
+        let i2 = i0 + quarter_n + quarter_n;
+        let i3 = i2 + quarter_n;
 
-        let src_offset1 = batch_offset + 2u32 * i1;
-        let src_offset2 = batch_offset + 2u32 * i2;
-        let src_offset3 = batch_offset + 2u32 * i3;
-        let src_offset4 = batch_offset + 2u32 * i4;
+        let s0 = batch_offset + 2u32 * i0;
+        let s1 = batch_offset + 2u32 * i1;
+        let s2 = batch_offset + 2u32 * i2;
+        let s3 = batch_offset + 2u32 * i3;
 
-        let re1 = get!(SRC)[src_offset1];
-        let im1 = get!(SRC)[src_offset1 + 1u32];
-        let re2 = get!(SRC)[src_offset2];
-        let im2 = get!(SRC)[src_offset2 + 1u32];
-        let re3 = get!(SRC)[src_offset3];
-        let im3 = get!(SRC)[src_offset3 + 1u32];
-        let re4 = get!(SRC)[src_offset4];
-        let im4 = get!(SRC)[src_offset4 + 1u32];
+        let x0r = get!(SRC)[s0];
+        let x0i = get!(SRC)[s0 + 1u32];
+        let x1r = get!(SRC)[s1];
+        let x1i = get!(SRC)[s1 + 1u32];
+        let x2r = get!(SRC)[s2];
+        let x2i = get!(SRC)[s2 + 1u32];
+        let x3r = get!(SRC)[s3];
+        let x3i = get!(SRC)[s3 + 1u32];
 
-        // Twiddle lookup: index = k * (half_n / p) = k * (half_n >> stage).
-        let twiddle_idx = k * (half_n >> stage);
-        let wr1 = get!(TWIDDLE)[2u32 * twiddle_idx];
-        let wi1 = get!(TWIDDLE)[2u32 * twiddle_idx + 1u32];
-        let wr2 = get!(TWIDDLE)[2u32 * (twiddle_idx * 2u32)];
-        let wi2 = get!(TWIDDLE)[2u32 * (twiddle_idx * 2u32) + 1u32];
-        let wr3 = get!(TWIDDLE)[2u32 * (twiddle_idx * 3u32)];
-        let wi3 = get!(TWIDDLE)[2u32 * (twiddle_idx * 3u32) + 1u32];
+        let stride = quarter_n >> (r4_stage + r4_stage);
+        let tw1 = k * stride;
+        let tw2 = tw1 * 2u32;
+        let tw3 = tw1 * 3u32;
 
-        // Radix-4 butterfly
-        let tr1 = wr1 * re2 - wi1 * im2;
-        let ti1 = wr1 * im2 + wi1 * re2;
-        let tr2 = wr2 * re3 - wi2 * im3;
-        let ti2 = wr2 * im3 + wi2 * re3;
-        let tr3 = wr3 * re4 - wi3 * im4;
-        let ti3 = wr3 * im4 + wi3 * re4;
+        let wr1 = get!(TWIDDLE)[2u32 * tw1];
+        let wi1 = get!(TWIDDLE)[2u32 * tw1 + 1u32];
+        let wr2 = get!(TWIDDLE)[2u32 * tw2];
+        let wi2 = get!(TWIDDLE)[2u32 * tw2 + 1u32];
+        let wr3 = get!(TWIDDLE)[2u32 * tw3];
+        let wi3 = get!(TWIDDLE)[2u32 * tw3 + 1u32];
 
-        // Destination: shuffled write for autosort ordering.
-        let out1 = j * four_p + k;
-        let out2 = out1 + p;
-        let out3 = out1 + two_p;
-        let out4 = out1 + three_p;
+        let br = wr1 * x1r - wi1 * x1i;
+        let bi = wr1 * x1i + wi1 * x1r;
+        let cr = wr2 * x2r - wi2 * x2i;
+        let ci = wr2 * x2i + wi2 * x2r;
+        let dr = wr3 * x3r - wi3 * x3i;
+        let di = wr3 * x3i + wi3 * x3r;
 
-        let dst_offset1 = batch_offset + 2u32 * out1;
-        let dst_offset2 = batch_offset + 2u32 * out2;
-        let dst_offset3 = batch_offset + 2u32 * out3;
-        let dst_offset4 = batch_offset + 2u32 * out4;
+        let o0 = j * four_p + k;
+        let o1 = o0 + p;
+        let o2 = o0 + p + p;
+        let o3 = o2 + p;
 
-        get_mut!(DST)[dst_offset1] = re1 + tr1 + tr2 + tr3;
-        get_mut!(DST)[dst_offset1 + 1u32] = im1 + ti1 + ti2 + ti3;
-        get_mut!(DST)[dst_offset2] = re1 + tr1 - tr2 - tr3;
-        get_mut!(DST)[dst_offset2 + 1u32] = im1 + ti1 - ti2 - ti3;
-        get_mut!(DST)[dst_offset3] = re1 - tr1 + tr2 - tr3;
-        get_mut!(DST)[dst_offset3 + 1u32] = im1 - ti1 + ti2 - ti3;
-        get_mut!(DST)[dst_offset4] = re1 - tr1 - tr2 + tr3;
-        get_mut!(DST)[dst_offset4 + 1u32] = im1 - ti1 - ti2 + ti3;
+        let d0 = batch_offset + 2u32 * o0;
+        let d1 = batch_offset + 2u32 * o1;
+        let d2 = batch_offset + 2u32 * o2;
+        let d3 = batch_offset + 2u32 * o3;
+
+        get_mut!(DST)[d0] = x0r + br + cr + dr;
+        get_mut!(DST)[d0 + 1u32] = x0i + bi + ci + di;
+        get_mut!(DST)[d1] = x0r + bi - cr - di;
+        get_mut!(DST)[d1 + 1u32] = x0i - br - ci + dr;
+        get_mut!(DST)[d2] = x0r - br + cr - dr;
+        get_mut!(DST)[d2 + 1u32] = x0i - bi + ci - di;
+        get_mut!(DST)[d3] = x0r - bi - cr + di;
+        get_mut!(DST)[d3 + 1u32] = x0i + br - ci - dr;
     }
 }
 

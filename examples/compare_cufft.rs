@@ -54,34 +54,40 @@ fn main() {
     // Test cuFFT implementation (if available)
     #[cfg(feature = "cuda")]
     {
-        if CuFft::is_available() {
-            println!("\nTesting cuFFT Implementation:");
-            println!("------------------------------");
+        match CuFft::new(fft_size) {
+            Ok(cufft) => {
+                println!("\nTesting cuFFT Implementation:");
+                println!("------------------------------");
 
-            let cufft = CuFft::new(fft_size).expect("Failed to create cuFFT instance");
+                for &batch_size in &batch_sizes {
+                    let batch_inputs: Vec<Vec<Complex<f32>>> = inputs[..batch_size].to_vec();
 
-            for &batch_size in &batch_sizes {
-                let batch_inputs: Vec<Vec<Complex<f32>>> = inputs[..batch_size].to_vec();
+                    // Warm-up
+                    let _ = cufft.batch_fft(&batch_inputs).expect("FFT failed");
 
-                // Warm-up
-                let _ = cufft.batch_fft(&batch_inputs).expect("FFT failed");
+                    // Timed run
+                    let start = Instant::now();
+                    let _results = cufft.batch_fft(&batch_inputs).expect("FFT failed");
+                    let duration = start.elapsed();
 
-                // Timed run
-                let start = Instant::now();
-                let _results = cufft.batch_fft(&batch_inputs).expect("FFT failed");
-                let duration = start.elapsed();
+                    let total_samples = batch_size * fft_size;
+                    let samples_per_second = total_samples as f64 / duration.as_secs_f64();
+                    let mega_samples_per_second = samples_per_second / 1_000_000.0;
 
-                let total_samples = batch_size * fft_size;
-                let samples_per_second = total_samples as f64 / duration.as_secs_f64();
-                let mega_samples_per_second = samples_per_second / 1_000_000.0;
-
-                println!(
-                    "Batch Size {}: {:.2} MSa/s",
-                    batch_size, mega_samples_per_second
-                );
+                    println!(
+                        "Batch Size {}: {:.2} MSa/s",
+                        batch_size, mega_samples_per_second
+                    );
+                }
             }
-        } else {
-            println!("\ncuFFT not available (CUDA not found)");
+            Err(e) => {
+                println!("\ncuFFT not available ({e})");
+                if e.to_string().contains("CUFFT_NOT_SUPPORTED") {
+                    println!(
+                        "Hint: try launching with LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+                    );
+                }
+            }
         }
     }
 
