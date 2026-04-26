@@ -25,6 +25,8 @@ mod shaders;
 /// Falls back to CPU-based software rendering when no GPU is available.
 use std::cell::RefCell;
 
+use std::any::Any;
+
 /// Trait for FFT implementations that can be benchmarked.
 pub trait FftExecutor {
     fn name(&self) -> &str;
@@ -36,11 +38,37 @@ pub trait FftExecutor {
         &self,
         inputs: &[Vec<Complex<f32>>],
     ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>>;
+    
+    /// Get a reference to the underlying type for downcasting.
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// Trait for GPU FFT implementations that support GPU-only benchmarking.
+pub trait GpuFftTrait {
+    /// Benchmark only the GPU compute pass and DMA operations (isolated from CPU overhead).
+    /// Returns duration in seconds for the GPU operations only.
+    fn benchmark_gpu_only(
+        &self,
+        sc: &SizeCache,
+        batch_size: u32,
+        n: usize,
+        warmup_iters: usize,
+        bench_iters: usize,
+    ) -> Result<f64, Box<dyn std::error::Error>>;
+    
+    /// Get or build size-specific GPU resources.
+    fn get_or_build_size_cache(&self, n: usize, log_n: u32) -> SizeCache;
+    
+    /// Prepare input data for GPU processing, applying conjugation for IFFT if needed.
+    fn prepare_input_data(&self, input: &[Complex<f32>], inverse: bool) -> Vec<f32>;
+    
+    /// Get the queue for GPU operations.
+    fn queue(&self) -> &wgpu::Queue;
 }
 
 pub struct GpuFft {
     device: wgpu::Device,
-    queue: wgpu::Queue,
+    pub queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     cache: RefCell<std::collections::HashMap<usize, SizeCache>>,
 }
@@ -62,6 +90,60 @@ impl FftExecutor for GpuFft {
         inputs: &[Vec<Complex<f32>>],
     ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>> {
         self.transform_batch_internal(inputs, true)
+    }
+    
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl GpuFftTrait for GpuFft {
+    fn benchmark_gpu_only(
+        &self,
+        sc: &SizeCache,
+        batch_size: u32,
+        n: usize,
+        warmup_iters: usize,
+        bench_iters: usize,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        use std::time::Instant;
+        
+        // Warmup
+        for _ in 0..warmup_iters {
+            self.execute_compute_pass(sc, batch_size, n);
+            // Ensure completion before next iteration
+            self.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })?;
+        }
+
+        // Benchmark
+        let start = Instant::now();
+        for _ in 0..bench_iters {
+            self.execute_compute_pass(sc, batch_size, n);
+        }
+        
+        // Wait for all submissions to complete
+        self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })?;
+        
+        let duration = start.elapsed();
+        Ok(duration.as_secs_f64() / bench_iters as f64)
+    }
+    
+    fn get_or_build_size_cache(&self, n: usize, log_n: u32) -> SizeCache {
+        self.get_or_build_size_cache(n, log_n)
+    }
+    
+    fn prepare_input_data(&self, input: &[Complex<f32>], inverse: bool) -> Vec<f32> {
+        self.prepare_input_data(input, inverse)
+    }
+    
+    fn queue(&self) -> &wgpu::Queue {
+        &self.queue
     }
 }
 
@@ -139,7 +221,7 @@ mod tests {
 
 /// Pre-allocated GPU resources for a specific FFT size.
 #[derive(Clone)]
-struct SizeCache {
+pub struct SizeCache {
     buf_a: wgpu::Buffer,
     buf_b: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
@@ -424,7 +506,7 @@ impl GpuFft {
     }
 
     /// Prepare input data for GPU processing, applying conjugation for IFFT if needed.
-    fn prepare_input_data(&self, input: &[Complex<f32>], inverse: bool) -> Vec<f32> {
+    pub fn prepare_input_data(&self, input: &[Complex<f32>], inverse: bool) -> Vec<f32> {
         if inverse {
             // For IFFT: conjugate input
             input.iter().flat_map(|c| [c.re, -c.im]).collect()
@@ -515,8 +597,46 @@ impl GpuFft {
         }
     }
 
+    /// Benchmark only the GPU compute pass and DMA operations (isolated from CPU overhead).
+    /// Returns duration in seconds for the GPU operations only.
+    fn benchmark_gpu_only(
+        &self,
+        sc: &SizeCache,
+        batch_size: u32,
+        n: usize,
+        warmup_iters: usize,
+        bench_iters: usize,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        use std::time::Instant;
+        
+        // Warmup
+        for _ in 0..warmup_iters {
+            self.execute_compute_pass(sc, batch_size, n);
+            // Ensure completion before next iteration
+            self.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })?;
+        }
+
+        // Benchmark
+        let start = Instant::now();
+        for _ in 0..bench_iters {
+            self.execute_compute_pass(sc, batch_size, n);
+        }
+        
+        // Wait for all submissions to complete
+        self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })?;
+        
+        let duration = start.elapsed();
+        Ok(duration.as_secs_f64() / bench_iters as f64)
+    }
+
     /// Get or build size-specific GPU resources.
-    fn get_or_build_size_cache(&self, n: usize, log_n: u32) -> SizeCache {
+    pub fn get_or_build_size_cache(&self, n: usize, log_n: u32) -> SizeCache {
         let mut cache = self.cache.borrow_mut();
         if let Some(sc) = cache.get(&n) {
             return sc.clone();

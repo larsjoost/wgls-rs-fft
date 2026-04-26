@@ -1,6 +1,8 @@
+use std::any::Any;
 use std::cell::RefCell;
 use std::num::NonZeroU64;
 
+use bytemuck;
 use num_complex::Complex;
 use wgsl_rs::wgsl;
 
@@ -556,4 +558,12 @@ impl FftExecutor for Radix4ProperFft {
     ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>> {
         self.transform_batch_internal(inputs, true)
     }
+    
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
+
+// Note: Radix4ProperFft doesn't implement GpuFftTrait yet
+// It would need a custom implementation since it has a different architecture
+// than the base GpuFft class. For now, it will use full benchmarking.

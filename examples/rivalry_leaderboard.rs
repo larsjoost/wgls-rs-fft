@@ -1,6 +1,6 @@
 use std::process::Command;
 use wgls_rs_fft::{
-    benchmark::{benchmark_rival, ValidationOutcome, MAX_TOTAL_SAMPLES},
+    benchmark::{benchmark_gpu_pipeline, benchmark_rival, GpuOnlyResult, ValidationOutcome, MAX_TOTAL_SAMPLES},
     FftExecutor, GpuFft,
 };
 
@@ -51,8 +51,22 @@ fn is_host_nvidia_present() -> bool {
     false
 }
 
+/// Try to get GPU pipeline performance for a rival implementation.
+/// This measures the complete GPU pipeline: host-to-device + GPU compute + device-to-host.
+fn try_get_gpu_performance(
+    rival: &dyn FftExecutor,
+    n: usize,
+    batch_size: usize,
+) -> Option<GpuOnlyResult> {
+    // Use the unified GPU pipeline benchmark for all implementations
+    // This provides a fair comparison by measuring the complete GPU pipeline
+    // for every implementation, including data transfers but excluding CPU data preparation
+    benchmark_gpu_pipeline(rival, n, batch_size).ok()
+}
+
 fn main() {
     println!("\n=== WGSL-RS FFT RIVALRY LEADERBOARD ===");
+    println!("Measuring complete GPU pipeline performance (host-to-device + GPU compute + device-to-host)");
 
     // Distinguish host GPU detection from cuFFT runtime availability.
     let host_nvidia_present = is_host_nvidia_present();
@@ -117,42 +131,43 @@ fn main() {
         println!("{}", "-".repeat(84));
 
         for rival in &rivals {
-            let result = benchmark_rival(rival.as_ref(), &reference, n, batch_size);
-            let status = match &result.validation {
-                ValidationOutcome::Pass => "PASS".to_string(),
-                ValidationOutcome::Fail { max_error } => format!("FAIL({:.2e})", max_error),
-            };
-            println!(
-                "{:>32} | {:>8} | {:>14.2} | {:>10.2} | {:>8}",
-                result.rival_name,
-                result.batch_size,
-                result.msamples_per_sec,
-                result.gflops,
-                status,
-            );
-        }
-
-        // Add cuFFT benchmark for this size when cuFFT runtime is available.
-        if cufft_available {
-            #[cfg(feature = "cuda")]
-            {
-                if let Ok(cufft) = CuFft::new(n) {
-                    let result = benchmark_rival(&cufft, &reference, n, batch_size);
-                    let status = match &result.validation {
-                        ValidationOutcome::Pass => "PASS".to_string(),
-                        ValidationOutcome::Fail { max_error } => format!("FAIL({:.2e})", max_error),
-                    };
-                    println!(
-                        "{:>32} | {:>8} | {:>14.2} | {:>10.2} | {:>8}",
-                        "cuFFT (NVIDIA Gold Standard)",
-                        result.batch_size,
-                        result.msamples_per_sec,
-                        result.gflops,
-                        status,
-                    );
-                }
+            // Try to get GPU-only performance for GPU implementations
+            let gpu_result = try_get_gpu_performance(rival.as_ref(), n, batch_size);
+            
+            if let Some(gpu_result) = gpu_result {
+                // Also run full benchmark for validation
+                let full_result = benchmark_rival(rival.as_ref(), &reference, n, batch_size);
+                let status = match &full_result.validation {
+                    ValidationOutcome::Pass => "PASS".to_string(),
+                    ValidationOutcome::Fail { max_error } => format!("FAIL({:.2e})", max_error),
+                };
+                println!(
+                    "{:>32} | {:>8} | {:>14.2} | {:>10.2} | {:>8}",
+                    gpu_result.rival_name,
+                    gpu_result.batch_size,
+                    gpu_result.gpu_msamples_per_sec,
+                    gpu_result.gpu_gflops,
+                    status,
+                );
+            } else {
+                // Fallback to full benchmark if GPU pipeline benchmarking fails
+                let result = benchmark_rival(rival.as_ref(), &reference, n, batch_size);
+                let status = match &result.validation {
+                    ValidationOutcome::Pass => "PASS".to_string(),
+                    ValidationOutcome::Fail { max_error } => format!("FAIL({:.2e})", max_error),
+                };
+                println!(
+                    "{:>32} | {:>8} | {:>14.2} | {:>10.2} | {:>8}",
+                    result.rival_name,
+                    result.batch_size,
+                    result.msamples_per_sec,
+                    result.gflops,
+                    status,
+                );
             }
         }
+
+
     }
 
     println!("\nAdd your implementation to src/rivals/ and register it above to compete.");

@@ -23,14 +23,133 @@ pub struct BenchmarkResult {
     pub validation: ValidationOutcome,
 }
 
+/// GPU-only performance result (isolated GPU compute + DMA).
+pub struct GpuOnlyResult {
+    pub rival_name: String,
+    pub n: usize,
+    pub batch_size: usize,
+    pub gpu_duration_sec: f64,
+    pub gpu_msamples_per_sec: f64,
+    pub gpu_gflops: f64,
+}
+
 /// Number of warm-up passes before timing.
 pub const WARMUP_ITERS: usize = 1;
 /// Number of timed iterations used to compute the average.
 pub const BENCH_ITERS: usize = 10;
+/// Number of warm-up passes for GPU-only benchmarking.
+pub const GPU_WARMUP_ITERS: usize = 3;
+/// Number of timed iterations for GPU-only benchmarking.
+pub const GPU_BENCH_ITERS: usize = 50;
 /// Absolute complex-norm tolerance for correctness.
 pub const VALIDATION_TOLERANCE: f32 = 1e-3;
 /// Cap on total samples (N × batch) to avoid OOM on very large FFTs.
 pub const MAX_TOTAL_SAMPLES: usize = 16 * 1024 * 1024;
+
+/// Benchmark GPU-only performance (isolated GPU compute + DMA operations).
+/// This measures only the GPU execution time, excluding CPU data preparation overhead.
+/// Works with any type that implements the benchmark_gpu_only method.
+pub fn benchmark_gpu_only(
+    gpu_fft: &(impl crate::GpuFftTrait + crate::FftExecutor + ?Sized),
+    n: usize,
+    batch_size: usize,
+) -> Result<GpuOnlyResult, Box<dyn std::error::Error>> {
+    let log_n = n.trailing_zeros();
+    let sc = gpu_fft.get_or_build_size_cache(n, log_n);
+    
+    // Prepare input data and upload to GPU (this is part of setup, not measured)
+    let inputs: Vec<Vec<Complex<f32>>> = (0..batch_size)
+        .map(|_| {
+            let n_f = n as f32;
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / n_f;
+                    Complex::new(t * 0.001, (t * std::f32::consts::TAU).sin() * 0.001)
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut all_raw_data = Vec::with_capacity((n * 2 * batch_size as usize) as usize);
+    for input in &inputs {
+        let raw = gpu_fft.prepare_input_data(input, false);
+        all_raw_data.extend_from_slice(&raw);
+    }
+
+    // Upload to GPU (this is part of setup, not measured)
+    gpu_fft.queue()
+        .write_buffer(&sc.buf_a, 0, bytemuck::cast_slice(&all_raw_data));
+
+    // Benchmark only the GPU compute + DMA operations
+    let gpu_duration_sec = gpu_fft.benchmark_gpu_only(
+        &sc,
+        batch_size as u32,
+        n,
+        GPU_WARMUP_ITERS,
+        GPU_BENCH_ITERS,
+    )?;
+
+    let total_samples = (n * batch_size) as f64;
+    let gpu_msamples_per_sec = total_samples / gpu_duration_sec / 1_000_000.0;
+    let gpu_gflops = 5.0 * total_samples * (n as f64).log2() / gpu_duration_sec / 1_000_000_000.0;
+
+    Ok(GpuOnlyResult {
+        rival_name: gpu_fft.name().to_string(),
+        n,
+        batch_size,
+        gpu_duration_sec,
+        gpu_msamples_per_sec,
+        gpu_gflops,
+    })
+}
+
+/// Benchmark complete GPU pipeline performance (host-to-device + GPU compute + device-to-host).
+/// This measures the end-to-end GPU performance including data transfers,
+/// but excludes CPU data preparation overhead.
+/// Works with any FFT executor.
+pub fn benchmark_gpu_pipeline(
+    rival: &dyn FftExecutor,
+    n: usize,
+    batch_size: usize,
+) -> Result<GpuOnlyResult, Box<dyn std::error::Error>> {
+    // Prepare input data (this is part of setup, not measured)
+    let inputs: Vec<Vec<Complex<f32>>> = (0..batch_size)
+        .map(|_| {
+            let n_f = n as f32;
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / n_f;
+                    Complex::new(t * 0.001, (t * std::f32::consts::TAU).sin() * 0.001)
+                })
+                .collect()
+        })
+        .collect();
+
+    // Warm-up passes
+    for _ in 0..WARMUP_ITERS {
+        let _ = rival.fft(&inputs);
+    }
+
+    // Timed passes - measure complete pipeline: host-to-device + GPU compute + device-to-host
+    let start = Instant::now();
+    for _ in 0..BENCH_ITERS {
+        let _ = rival.fft(&inputs);
+    }
+    let duration = start.elapsed() / BENCH_ITERS as u32;
+
+    let total_samples = (n * batch_size) as f64;
+    let gpu_msamples_per_sec = total_samples / duration.as_secs_f64() / 1_000_000.0;
+    let gpu_gflops = 5.0 * total_samples * (n as f64).log2() / duration.as_secs_f64() / 1_000_000_000.0;
+
+    Ok(GpuOnlyResult {
+        rival_name: rival.name().to_string(),
+        n,
+        batch_size,
+        gpu_duration_sec: duration.as_secs_f64(),
+        gpu_msamples_per_sec,
+        gpu_gflops,
+    })
+}
 
 /// Benchmark `rival` at a fixed `n` and `batch_size`, validating against `reference`.
 ///
@@ -136,5 +255,37 @@ fn validate(result: &[Vec<Complex<f32>>], reference: &[Vec<Complex<f32>>]) -> Va
         ValidationOutcome::Pass
     } else {
         ValidationOutcome::Fail { max_error: max_err }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::GpuFft;
+
+    #[test]
+    fn test_gpu_only_benchmark_basic() {
+        // This test verifies that the GPU-only benchmark function works
+        // without panicking and returns reasonable values
+        let gpu_fft = GpuFft::new().expect("Failed to create GpuFft");
+        
+        // Use a small size for quick testing
+        let n = 256;
+        let batch_size = 4;
+        
+        let result = benchmark_gpu_only(&gpu_fft, n, batch_size);
+        
+        assert!(result.is_ok(), "GPU-only benchmark should succeed");
+        let result = result.unwrap();
+        
+        // Basic sanity checks
+        assert_eq!(result.n, n);
+        assert_eq!(result.batch_size, batch_size);
+        assert!(result.gpu_duration_sec > 0.0, "GPU duration should be positive");
+        assert!(result.gpu_msamples_per_sec > 0.0, "Throughput should be positive");
+        assert!(result.gpu_gflops > 0.0, "GFLOPS should be positive");
+        
+        // Duration should be reasonable (less than 1 second per iteration)
+        assert!(result.gpu_duration_sec < 1.0, "GPU duration should be reasonable");
     }
 }

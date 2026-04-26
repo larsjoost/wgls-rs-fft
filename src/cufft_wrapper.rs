@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use crate::FftExecutor;
 use cudarc::cufft::{sys, CudaFft, FftDirection};
 use cudarc::driver::{CudaContext, CudaStream};
@@ -25,7 +27,15 @@ impl FftExecutor for CuFft {
     fn ifft(&self, inputs: &[Vec<Complex<f32>>]) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn Error>> {
         self.batch_ifft(inputs)
     }
+    
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
+
+// Note: cuFFT uses a completely different architecture (CUDA vs wgpu)
+// so it needs a specialized GPU-only benchmark implementation
+// For now, cuFFT will use the full benchmarking path
 
 impl CuFft {
     /// Create a new cuFFT instance.

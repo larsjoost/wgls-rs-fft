@@ -1,7 +1,12 @@
+use std::any::Any;
+
 use crate::{FftExecutor, GpuFft};
 use num_complex::Complex;
 
-pub struct StockhamBaseline(GpuFft);
+// Need wgpu for the GpuFftTrait implementation
+use wgpu;
+
+pub struct StockhamBaseline(pub GpuFft);
 
 impl StockhamBaseline {
     pub fn new() -> Self {
@@ -24,5 +29,34 @@ impl FftExecutor for StockhamBaseline {
         inputs: &[Vec<Complex<f32>>],
     ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>> {
         self.0.ifft(inputs)
+    }
+    
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl crate::GpuFftTrait for StockhamBaseline {
+    fn benchmark_gpu_only(
+        &self,
+        sc: &crate::SizeCache,
+        batch_size: u32,
+        n: usize,
+        warmup_iters: usize,
+        bench_iters: usize,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        self.0.benchmark_gpu_only(sc, batch_size, n, warmup_iters, bench_iters)
+    }
+    
+    fn get_or_build_size_cache(&self, n: usize, log_n: u32) -> crate::SizeCache {
+        self.0.get_or_build_size_cache(n, log_n)
+    }
+    
+    fn prepare_input_data(&self, input: &[Complex<f32>], inverse: bool) -> Vec<f32> {
+        self.0.prepare_input_data(input, inverse)
+    }
+    
+    fn queue(&self) -> &wgpu::Queue {
+        self.0.queue()
     }
 }

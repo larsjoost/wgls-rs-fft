@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use crate::FftExecutor;
 use num_complex::Complex;
 use std::cell::RefCell;
@@ -698,5 +700,9 @@ impl FftExecutor for GeminiFft {
         inputs: &[Vec<Complex<f32>>],
     ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>> {
         self.transform_batch_internal(inputs, true)
+    }
+    
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

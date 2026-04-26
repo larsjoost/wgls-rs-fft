@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::cell::RefCell;
 use std::num::NonZeroU64;
 
@@ -710,5 +711,9 @@ impl FftExecutor for ClaudeFft {
         inputs: &[Vec<Complex<f32>>],
     ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>> {
         self.transform_batch_internal(inputs, true)
+    }
+    
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
