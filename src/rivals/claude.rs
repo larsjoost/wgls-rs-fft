@@ -6,29 +6,144 @@ use wgsl_rs::wgsl;
 
 use crate::FftExecutor;
 
+// ── WGSL: Stockham Radix-8 DIT ───────────────────────────────────────────────
+//
+// Each thread handles one 8-point butterfly (reads N/8 elements of the signal).
+// Stage s: p = 8^s, stride = (N/8) / p
+//
+// Split into even/odd 4-point DFTs, combine with W_8^k constants:
+//   W_8^0=1, W_8^1=(1-i)/√2, W_8^2=-i, W_8^3=-(1+i)/√2
+//
+// Output Stockham positions: o_m = j*8p + k + m*p  (m=0..7)
+const CLAUDE_R8_WGSL: &str = r#"
+@group(0) @binding(0) var<uniform> U: vec4<u32>;
+@group(0) @binding(1) var<storage, read_write> SRC: array<f32>;
+@group(0) @binding(2) var<storage, read_write> DST: array<f32>;
+@group(0) @binding(3) var<storage, read> TWIDDLE: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tid      = gid.x;
+    let batch_id = gid.y;
+    let n        = U.x;
+    let e        = n >> 3u;   // eighth_n = N/8
+    if tid >= e { return; }
+
+    let stage  = U.y;
+    let p      = 1u << (stage * 3u);   // 8^stage
+    let eight_p = p << 3u;
+
+    let k = tid % p;
+    let j = tid / p;
+
+    let bo = batch_id * n * 2u;   // batch offset in floats
+
+    let i0 = j*p + k;
+    let i1 = i0 + e;      let i2 = i0 + 2u*e;  let i3 = i0 + 3u*e;
+    let i4 = i0 + 4u*e;   let i5 = i0 + 5u*e;  let i6 = i0 + 6u*e;  let i7 = i0 + 7u*e;
+
+    let s0 = bo + 2u*i0; let s1 = bo + 2u*i1; let s2 = bo + 2u*i2; let s3 = bo + 2u*i3;
+    let s4 = bo + 2u*i4; let s5 = bo + 2u*i5; let s6 = bo + 2u*i6; let s7 = bo + 2u*i7;
+
+    let x0r = SRC[s0]; let x0i = SRC[s0+1u];
+    let x1r = SRC[s1]; let x1i = SRC[s1+1u];
+    let x2r = SRC[s2]; let x2i = SRC[s2+1u];
+    let x3r = SRC[s3]; let x3i = SRC[s3+1u];
+    let x4r = SRC[s4]; let x4i = SRC[s4+1u];
+    let x5r = SRC[s5]; let x5i = SRC[s5+1u];
+    let x6r = SRC[s6]; let x6i = SRC[s6+1u];
+    let x7r = SRC[s7]; let x7i = SRC[s7+1u];
+
+    // External twiddles from pre-computed table (tw_m = m * k * stride)
+    let stride = e >> (stage * 3u);
+    let tw1 = k*stride; let tw2 = 2u*tw1; let tw3 = 3u*tw1;
+    let tw4 = 4u*tw1;   let tw5 = 5u*tw1; let tw6 = 6u*tw1; let tw7 = 7u*tw1;
+
+    // b0 = x0 (W^0 = 1), bm = W_N^twm * xm
+    let b0r = x0r; let b0i = x0i;
+
+    let wr1 = TWIDDLE[2u*tw1]; let wi1 = TWIDDLE[2u*tw1+1u];
+    let b1r = wr1*x1r - wi1*x1i; let b1i = wr1*x1i + wi1*x1r;
+
+    let wr2 = TWIDDLE[2u*tw2]; let wi2 = TWIDDLE[2u*tw2+1u];
+    let b2r = wr2*x2r - wi2*x2i; let b2i = wr2*x2i + wi2*x2r;
+
+    let wr3 = TWIDDLE[2u*tw3]; let wi3 = TWIDDLE[2u*tw3+1u];
+    let b3r = wr3*x3r - wi3*x3i; let b3i = wr3*x3i + wi3*x3r;
+
+    let wr4 = TWIDDLE[2u*tw4]; let wi4 = TWIDDLE[2u*tw4+1u];
+    let b4r = wr4*x4r - wi4*x4i; let b4i = wr4*x4i + wi4*x4r;
+
+    let wr5 = TWIDDLE[2u*tw5]; let wi5 = TWIDDLE[2u*tw5+1u];
+    let b5r = wr5*x5r - wi5*x5i; let b5i = wr5*x5i + wi5*x5r;
+
+    let wr6 = TWIDDLE[2u*tw6]; let wi6 = TWIDDLE[2u*tw6+1u];
+    let b6r = wr6*x6r - wi6*x6i; let b6i = wr6*x6i + wi6*x6r;
+
+    let wr7 = TWIDDLE[2u*tw7]; let wi7 = TWIDDLE[2u*tw7+1u];
+    let b7r = wr7*x7r - wi7*x7i; let b7i = wr7*x7i + wi7*x7r;
+
+    // 4-point DFT of even group [b0, b2, b4, b6]
+    let s04r = b0r+b4r; let s04i = b0i+b4i;
+    let d04r = b0r-b4r; let d04i = b0i-b4i;
+    let s26r = b2r+b6r; let s26i = b2i+b6i;
+    let d26r = b2r-b6r; let d26i = b2i-b6i;
+
+    // E[0]=s04+s26, E[2]=s04-s26, E[1]=d04+(-i)*d26, E[3]=d04+i*d26
+    let e0r = s04r+s26r; let e0i = s04i+s26i;
+    let e2r = s04r-s26r; let e2i = s04i-s26i;
+    let e1r = d04r+d26i; let e1i = d04i-d26r;
+    let e3r = d04r-d26i; let e3i = d04i+d26r;
+
+    // 4-point DFT of odd group [b1, b3, b5, b7]
+    let s15r = b1r+b5r; let s15i = b1i+b5i;
+    let d15r = b1r-b5r; let d15i = b1i-b5i;
+    let s37r = b3r+b7r; let s37i = b3i+b7i;
+    let d37r = b3r-b7r; let d37i = b3i-b7i;
+
+    let o0r = s15r+s37r; let o0i = s15i+s37i;
+    let o2r = s15r-s37r; let o2i = s15i-s37i;
+    let o1r = d15r+d37i; let o1i = d15i-d37r;
+    let o3r = d15r-d37i; let o3i = d15i+d37r;
+
+    // Combine with internal W_8^k constants (1/sqrt(2) = 0.70710678...)
+    // W_8^0=1, W_8^1=(1-i)/√2, W_8^2=-i, W_8^3=-(1+i)/√2
+    let s = 0.70710678118654752;
+
+    // W_8^1 * o1: re=(o1r+o1i)*s, im=(o1i-o1r)*s
+    let w1o1r = (o1r+o1i)*s; let w1o1i = (o1i-o1r)*s;
+    // W_8^2 * o2 = -i*o2: (o2i, -o2r)
+    let w2o2r = o2i;  let w2o2i = -o2r;
+    // W_8^3 * o3 = -(1+i)/√2 * o3: re=(-o3r+o3i)*s, im=-(o3r+o3i)*s
+    let w3o3r = (-o3r+o3i)*s; let w3o3i = -(o3r+o3i)*s;
+
+    // Y[k] = E[k] + W_8^k * O[k],  Y[k+4] = E[k] - W_8^k * O[k]
+    let y0r = e0r+o0r;    let y0i = e0i+o0i;
+    let y1r = e1r+w1o1r;  let y1i = e1i+w1o1i;
+    let y2r = e2r+w2o2r;  let y2i = e2i+w2o2i;
+    let y3r = e3r+w3o3r;  let y3i = e3i+w3o3i;
+    let y4r = e0r-o0r;    let y4i = e0i-o0i;
+    let y5r = e1r-w1o1r;  let y5i = e1i-w1o1i;
+    let y6r = e2r-w2o2r;  let y6i = e2i-w2o2i;
+    let y7r = e3r-w3o3r;  let y7i = e3i-w3o3i;
+
+    // Stockham output: o_m = j*eight_p + k + m*p
+    let d0 = bo + 2u*(j*eight_p + k);
+    let d1 = d0 + 2u*p; let d2 = d0 + 4u*p; let d3 = d0 + 6u*p;
+    let d4 = d0 + 8u*p; let d5 = d0 + 10u*p; let d6 = d0 + 12u*p; let d7 = d0 + 14u*p;
+
+    DST[d0]=y0r; DST[d0+1u]=y0i;
+    DST[d1]=y1r; DST[d1+1u]=y1i;
+    DST[d2]=y2r; DST[d2+1u]=y2i;
+    DST[d3]=y3r; DST[d3+1u]=y3i;
+    DST[d4]=y4r; DST[d4+1u]=y4i;
+    DST[d5]=y5r; DST[d5+1u]=y5i;
+    DST[d6]=y6r; DST[d6+1u]=y6i;
+    DST[d7]=y7r; DST[d7+1u]=y7i;
+}
+"#;
+
 // ── WGSL: Stockham Radix-4 DIT ───────────────────────────────────────────────
-//
-// Uniform U: .x = N, .y = radix-4 stage index s (0 .. log₄N-1)
-//
-// For stage s:
-//   p        = 4^s  = 1u32 << (s*2)
-//   quarter_n = N/4
-//   stride   = quarter_n >> (s*2)   = quarter_n / p
-//
-// Source indices (natural-order Stockham read):
-//   i0 = j*p+k,  i1 = i0+N/4,  i2 = i0+N/2,  i3 = i0+3N/4
-//
-// Twiddle indices into the N-entry table (max tw3 < 3N/4 < N — always in bounds):
-//   tw1 = k*stride,  tw2 = 2*tw1,  tw3 = 3*tw1
-//
-// Correct radix-4 DIT butterfly (b = W_tw1·x1, c = W_tw2·x2, d = W_tw3·x3):
-//   y0 = x0 + b + c + d
-//   y1 = x0 - i·b - c + i·d  →  re: x0r+bi-cr-di,  im: x0i-br-ci+dr
-//   y2 = x0 - b + c - d
-//   y3 = x0 + i·b - c - i·d  →  re: x0r-bi-cr+di,  im: x0i+br-ci-dr
-//
-// Output indices (Stockham autosort):
-//   o0 = j*4p+k,  o1 = o0+p,  o2 = o0+2p,  o3 = o0+3p
 #[wgsl]
 pub mod claude_r4_kernel {
     use wgsl_rs::std::*;
@@ -117,10 +232,7 @@ pub mod claude_r4_kernel {
     }
 }
 
-// ── WGSL: Stockham Radix-2 (finalisation for odd log₂N) ─────────────────────
-//
-// Identical to the baseline stockham kernel. Used as a single trailing stage
-// when log₂N is odd, with U.y = log₂N − 1, giving p = N/2.
+// ── WGSL: Stockham Radix-2 ───────────────────────────────────────────────────
 #[wgsl]
 pub mod claude_r2_kernel {
     use wgsl_rs::std::*;
@@ -197,8 +309,10 @@ struct ClaudeCache {
     staging_buf: wgpu::Buffer,
     #[allow(dead_code)]
     twiddle_buf: wgpu::Buffer,
-    stage_bgs_r4: Vec<wgpu::BindGroup>,
+    stage_bgs_r8: Vec<wgpu::BindGroup>,
+    stage_bg_r4: Option<wgpu::BindGroup>,
     stage_bg_r2: Option<wgpu::BindGroup>,
+    wg_n8: u32,
     wg_n4: u32,
     wg_n2: u32,
     result_in_b: bool,
@@ -207,6 +321,7 @@ struct ClaudeCache {
 pub struct ClaudeFft {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    pipeline_r8: wgpu::ComputePipeline,
     pipeline_r4: wgpu::ComputePipeline,
     pipeline_r2: wgpu::ComputePipeline,
     cache: RefCell<std::collections::HashMap<usize, ClaudeCache>>,
@@ -218,8 +333,15 @@ impl ClaudeFft {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
-            force_fallback_adapter: true,
+            force_fallback_adapter: false,
         }))
+        .or_else(|_| {
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: true,
+            }))
+        })
         .expect("no wgpu adapter");
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -227,7 +349,7 @@ impl ClaudeFft {
         }))
         .expect("no wgpu device");
 
-        let compile = |src: String, label: &str| {
+        let compile_wgsl = |src: &str, label: &str| {
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label),
                 source: wgpu::ShaderSource::Wgsl(src.into()),
@@ -242,18 +364,20 @@ impl ClaudeFft {
             })
         };
 
-        let pipeline_r4 = compile(
-            claude_r4_kernel::WGSL_MODULE.wgsl_source().join("\n"),
+        let pipeline_r8 = compile_wgsl(CLAUDE_R8_WGSL, "claude_r8");
+        let pipeline_r4 = compile_wgsl(
+            &claude_r4_kernel::WGSL_MODULE.wgsl_source().join("\n"),
             "claude_r4",
         );
-        let pipeline_r2 = compile(
-            claude_r2_kernel::WGSL_MODULE.wgsl_source().join("\n"),
+        let pipeline_r2 = compile_wgsl(
+            &claude_r2_kernel::WGSL_MODULE.wgsl_source().join("\n"),
             "claude_r2",
         );
 
         Self {
             device,
             queue,
+            pipeline_r8,
             pipeline_r4,
             pipeline_r2,
             cache: RefCell::new(std::collections::HashMap::new()),
@@ -261,9 +385,13 @@ impl ClaudeFft {
     }
 
     fn build_cache(&self, n: usize, log_n: u32) -> ClaudeCache {
-        let num_r4 = (log_n / 2) as usize;
-        let has_r2 = log_n % 2 == 1;
-        let total_stages = num_r4 + has_r2 as usize;
+        // Stage plan: as many radix-8 stages as possible, then radix-4 or radix-2 for remainder.
+        // log_n = 3*num_r8 + 2*num_r4 + num_r2
+        let num_r8 = (log_n / 3) as usize;
+        let rem = log_n % 3;
+        let has_r4 = rem == 2;
+        let has_r2 = rem == 1;
+        let total_stages = num_r8 + has_r4 as usize + has_r2 as usize;
 
         let single_bytes = (n * 2 * std::mem::size_of::<f32>()) as u64;
         let max_batch =
@@ -296,8 +424,8 @@ impl ClaudeFft {
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         );
 
-        // N-entry twiddle table: e^{-2πij/N} for j = 0..N.
-        // Max radix-4 twiddle index ≈ 3N/4 < N, so this table is always sufficient.
+        // N-entry twiddle table: e^{-2πij/N} for j=0..N
+        // Max radix-8 twiddle index = 7*(N/8) < N, always in bounds.
         let twiddles: Vec<f32> = (0..n)
             .flat_map(|j| {
                 let angle = -std::f32::consts::TAU * j as f32 / n as f32;
@@ -324,7 +452,8 @@ impl ClaudeFft {
             mapped_at_creation: false,
         });
 
-        for s in 0..num_r4 {
+        // Write uniforms for each stage.
+        for s in 0..num_r8 {
             self.queue.write_buffer(
                 &uniform_buf,
                 stride * s as u64,
@@ -336,13 +465,34 @@ impl ClaudeFft {
                 }),
             );
         }
-        if has_r2 {
+        let mut slot = num_r8;
+        if has_r4 {
+            // p after num_r8 radix-8 stages = 8^num_r8 = 2^(3*num_r8).
+            // The radix-4 kernel computes p = 4^stage = 2^(2*stage).
+            // So we need stage = 3*num_r8/2 (always integer when rem=2 and sizes are power-of-2).
+            let r4_stage = (3 * num_r8 as u32) / 2;
             self.queue.write_buffer(
                 &uniform_buf,
-                stride * num_r4 as u64,
+                stride * slot as u64,
                 bytemuck::bytes_of(&Uniforms {
                     n: n as u32,
-                    stage: log_n - 1,
+                    stage: r4_stage,
+                    log_n,
+                    _pad: 0,
+                }),
+            );
+            slot += 1;
+        }
+        if has_r2 {
+            // p after num_r8 radix-8 stages = 8^num_r8 = 2^(3*num_r8).
+            // The radix-2 kernel computes p = 2^stage, so stage = 3*num_r8.
+            let r2_stage = 3 * num_r8 as u32;
+            self.queue.write_buffer(
+                &uniform_buf,
+                stride * slot as u64,
+                bytemuck::bytes_of(&Uniforms {
+                    n: n as u32,
+                    stage: r2_stage,
                     log_n,
                     _pad: 0,
                 }),
@@ -382,25 +532,45 @@ impl ClaudeFft {
             })
         };
 
-        // Combined slot s: even → buf_a → buf_b, odd → buf_b → buf_a.
-        let stage_bgs_r4: Vec<wgpu::BindGroup> = (0..num_r4)
+        // Build bind groups: even slot → buf_a→buf_b, odd slot → buf_b→buf_a.
+        let stage_bgs_r8: Vec<wgpu::BindGroup> = (0..num_r8)
             .map(|s| {
                 let (src, dst) = if s % 2 == 0 {
                     (&buf_a, &buf_b)
                 } else {
                     (&buf_b, &buf_a)
                 };
-                make_bg(&self.pipeline_r4, src, dst, stride * s as u64)
+                make_bg(&self.pipeline_r8, src, dst, stride * s as u64)
             })
             .collect();
 
-        let stage_bg_r2 = if has_r2 {
-            let (src, dst) = if num_r4 % 2 == 0 {
+        let mut cur_slot = num_r8;
+
+        let stage_bg_r4 = if has_r4 {
+            let (src, dst) = if cur_slot % 2 == 0 {
                 (&buf_a, &buf_b)
             } else {
                 (&buf_b, &buf_a)
             };
-            Some(make_bg(&self.pipeline_r2, src, dst, stride * num_r4 as u64))
+            let bg = make_bg(&self.pipeline_r4, src, dst, stride * cur_slot as u64);
+            cur_slot += 1;
+            Some(bg)
+        } else {
+            None
+        };
+
+        let stage_bg_r2 = if has_r2 {
+            let (src, dst) = if cur_slot % 2 == 0 {
+                (&buf_a, &buf_b)
+            } else {
+                (&buf_b, &buf_a)
+            };
+            Some(make_bg(
+                &self.pipeline_r2,
+                src,
+                dst,
+                stride * cur_slot as u64,
+            ))
         } else {
             None
         };
@@ -410,8 +580,10 @@ impl ClaudeFft {
             buf_b,
             staging_buf,
             twiddle_buf,
-            stage_bgs_r4,
+            stage_bgs_r8,
+            stage_bg_r4,
             stage_bg_r2,
+            wg_n8: (n as u32 / 8).div_ceil(256),
             wg_n4: (n as u32 / 4).div_ceil(256),
             wg_n2: (n as u32 / 2).div_ceil(256),
             result_in_b: total_stages % 2 == 1,
@@ -437,10 +609,7 @@ impl ClaudeFft {
             return Ok(Vec::new());
         }
         let n = inputs[0].len();
-        assert!(
-            n.is_power_of_two() && n > 0,
-            "FFT size must be a non-zero power of two"
-        );
+        assert!(n.is_power_of_two() && n > 0);
         let log_n = n.trailing_zeros();
         let batch_size = inputs.len() as u32;
 
@@ -448,7 +617,7 @@ impl ClaudeFft {
 
         let mut raw: Vec<f32> = Vec::with_capacity(n * 2 * inputs.len());
         for input in inputs {
-            assert_eq!(input.len(), n, "all inputs must have the same length");
+            assert_eq!(input.len(), n);
             if inverse {
                 raw.extend(input.iter().flat_map(|c| [c.re, -c.im]));
             } else {
@@ -468,14 +637,19 @@ impl ClaudeFft {
                 label: Some("claude_fft_compute"),
                 timestamp_writes: None,
             });
-            for bg in &cache.stage_bgs_r4 {
+            for bg in &cache.stage_bgs_r8 {
+                pass.set_pipeline(&self.pipeline_r8);
+                pass.set_bind_group(0, bg, &[]);
+                pass.dispatch_workgroups(cache.wg_n8, batch_size, 1);
+            }
+            if let Some(bg) = &cache.stage_bg_r4 {
                 pass.set_pipeline(&self.pipeline_r4);
                 pass.set_bind_group(0, bg, &[]);
                 pass.dispatch_workgroups(cache.wg_n4, batch_size, 1);
             }
-            if let Some(r2_bg) = &cache.stage_bg_r2 {
+            if let Some(bg) = &cache.stage_bg_r2 {
                 pass.set_pipeline(&self.pipeline_r2);
-                pass.set_bind_group(0, r2_bg, &[]);
+                pass.set_bind_group(0, bg, &[]);
                 pass.dispatch_workgroups(cache.wg_n2, batch_size, 1);
             }
         }
@@ -489,7 +663,7 @@ impl ClaudeFft {
         enc.copy_buffer_to_buffer(result_buf, 0, &cache.staging_buf, 0, out_bytes);
         self.queue.submit(std::iter::once(enc.finish()));
 
-        let slice = cache.staging_buf.slice(..);
+        let slice = cache.staging_buf.slice(0..out_bytes);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::PollType::Wait {
             submission_index: None,
@@ -521,7 +695,7 @@ impl ClaudeFft {
 
 impl FftExecutor for ClaudeFft {
     fn name(&self) -> &str {
-        "Claude (Stockham Radix-4/2 Mixed)"
+        "Claude (Stockham Radix-8/4/2 Mixed)"
     }
 
     fn fft(

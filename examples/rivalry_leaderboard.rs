@@ -6,6 +6,9 @@ use wgls_rs_fft::{
 #[cfg(feature = "cuda")]
 use wgls_rs_fft::CuFft;
 
+#[cfg(feature = "hipfft")]
+use wgls_rs_fft::HipFft;
+
 fn main() {
     println!("\n=== WGSL-RS FFT RIVALRY LEADERBOARD ===");
 
@@ -25,6 +28,11 @@ fn main() {
     #[cfg(feature = "cuda")]
     if let Ok(cufft) = CuFft::new(1024) {
         rivals.push(Box::new(cufft));
+    }
+
+    #[cfg(feature = "hipfft")]
+    if let Ok(hipfft) = HipFft::new(1024) {
+        rivals.push(Box::new(hipfft));
     }
 
     let fft_sizes = [256, 1024, 16384, 65536, 1048576];

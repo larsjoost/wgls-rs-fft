@@ -4,16 +4,53 @@ Welcome, AI. Your goal is to implement a **1D Batched WebGPU FFT** that is a clo
 
 You should name your contribution your own name, so that your implementation can live amongst other ai implementations. Place your contribution in src/rivals/<name>, where <name> is your name. You are allowed to be inspired by the other contestends. You should compare your performance against the other contestends.
 
+Use rocFFT open source code as inspiration
+
 ## Phase 1: Research & Mandates
 1. **Read `REQUIREMENTS.md`:** Contains the optimization roadmap — Mixed-Radix, Subgroup Shuffles, Stockham vs. Cooley-Tukey, workgroup dispatch strategies.
 2. **Analyze the Baseline:** Read `src/shaders.rs` and `src/rivals/mod.rs` to understand the existing Radix-2 implementation and the `FftExecutor` trait.
 3. **Platform Support:** Implementations must only support Linux. Cross-platform compatibility is not required.
 
+## Known Pitfalls
+
+Bugs that have cost previous sessions significant time — fix these before anything else.
+
+### 1. Staging buffer slice
+```rust
+// WRONG — maps the entire pre-allocated max_batch buffer:
+let slice = staging_buf.slice(..);
+
+// CORRECT — map only the bytes actually written this batch:
+let out_bytes = (batch_size * n * 2 * std::mem::size_of::<f32>()) as u64;
+let slice = staging_buf.slice(0..out_bytes);
+```
+When `batch_size < max_batch`, `slice(..)` produces extra output chunks → validation returns `FAIL(inf)`.
+
+### 2. Adapter selection
+Always request a hardware adapter first; fall back to software only if unavailable:
+```rust
+let adapter = pollster::block_on(instance.request_adapter(
+    &wgpu::RequestAdapterOptions { force_fallback_adapter: false, .. }
+))
+.or_else(|_| pollster::block_on(instance.request_adapter(
+    &wgpu::RequestAdapterOptions { force_fallback_adapter: true, .. }
+)));
+```
+`force_fallback_adapter: true` unconditionally selects the software renderer (~5 MS/s vs ~150 MS/s on real hardware).
+
+### 3. Mixed-radix stage counter portability
+The radix-4 kernel computes `p = 4^stage`; the radix-8 kernel computes `p = 8^stage`. When chaining radix-8 then radix-4, the trailing radix-4 stage must receive `stage = 3*num_r8/2` (not 0) so that `p = 4^(3*num_r8/2) = 8^num_r8`. This requires `num_r8` to be even — true for all 5 test sizes but breaks for N=2048 or N=131072. **Prefer passing `p` directly in the uniform** rather than computing it from a stage index.
+
 ## Phase 2: Implementation
 
-You do not need to rewrite the `wgpu` boilerplate. Use `GpuFft::with_shader` to plug in your kernel.
+**Two implementation paths are available:**
 
-Create a new file (e.g., `src/rivals/radix4.rs`). Use the `#[wgsl]` macro — exactly as `src/shaders.rs` does — to define your kernel, then wrap it in `GpuFft::with_shader`:
+- **Path A (Simple) — `GpuFft::with_shader`:** Plug in a custom WGSL kernel without writing wgpu boilerplate. *Limitation: the framework always dispatches **log₂N** passes regardless of kernel radix, so a Radix-4 kernel still runs log₂N passes instead of log₄N.* Use for quick experiments only.
+- **Path B (Full control) — Custom wgpu infrastructure:** Build your own device, pipeline, and bind groups. Required to achieve true log₄N or log₈N pass counts. See `src/rivals/claude.rs` for a complete reference implementation using ping-pong buffers and per-stage pre-baked bind groups.
+
+**Path A — GpuFft::with_shader:**
+
+Create a new file (e.g., `src/rivals/radix4.rs`). Use the `#[wgsl]` macro — exactly as `src/shaders.rs` does — or a raw WGSL `const &str` string — to define your kernel, then wrap it in `GpuFft::with_shader`:
 
 ```rust
 use wgsl_rs::wgsl;
@@ -100,17 +137,40 @@ rivals.push(Box::new(MyAiRival::new()));
 | `VALIDATION_TOLERANCE` | 1e-3 | Max allowed absolute complex-norm error vs. baseline |
 | `MAX_TOTAL_SAMPLES` | 16 777 216 | N × batch cap to prevent OOM on large FFTs |
 
-`sweep_rival` calls `benchmark_rival` for each batch size in `[1, 16, 64, 256, 1024]`, skipping combinations where `N × batch > MAX_TOTAL_SAMPLES`, and reports the entry with the highest **MSamples/s**. Optimize for peak **Total Samples per Second** across that sweep.
+The leaderboard uses `benchmark_rival` with batch sizes chosen by `choose_batch_size(n)` in `examples/rivalry_leaderboard.rs`:
+
+| N | Batch size |
+|---|---|
+| 256 | 1024 |
+| 1 024 | 1024 |
+| 16 384 | 256 |
+| 65 536 | 64 |
+| 1 048 576 | 1 |
+
+Optimize for throughput across these specific (N, batch) pairs.
 
 **Validation:** one extra forward FFT is run after timing and compared sample-by-sample against the Stockham Radix-2 baseline. The result is `PASS` if every output sample satisfies `|rival − baseline| ≤ VALIDATION_TOLERANCE`, and `FAIL(max_err)` otherwise. Do **not** compare a rival's output to its own output — the leaderboard handles this correctly.
 
+**Test hardware:** NVIDIA GeForce GTX 1070, wgpu via **Vulkan** backend.
+
+| Property | Value |
+|---|---|
+| Streaming Multiprocessors | 15 |
+| Warp / wavefront size | 32 |
+| VRAM bandwidth | ~256 GB/s |
+| Max workgroup size | 1024 |
+| `wgpu::Features::SUBGROUP` | Available |
+
 **Performance goals (WebGPU tier):**
 
-| Target | N=1024 |
+| Target | Description |
 |---|---|
 | Beat the Stockham Radix-2 baseline | Required |
-| 2× baseline throughput (Radix-4/8) | Good |
-| Peak WebGPU bandwidth utilization (>70% roofline) | Excellent |
+| 2–3× baseline at N=1024 (Radix-4 or Radix-8) | Good |
+| 4–5× baseline at N=1024 (Radix-8 + hardware adapter) | Excellent |
+| >70% roofline bandwidth utilization | Aspirational |
+
+Current best (Claude, Radix-8/4/2 Mixed): ~2.5–4.5× baseline across all 5 sizes.
 
 cuFFT / rocFFT numbers appear in the leaderboard as reference only. They use vendor-tuned CUDA PTX on dedicated hardware — WebGPU/WGSL implementations are not expected to match them.
 
@@ -153,6 +213,30 @@ After implementing your FFT, perform a structured review to refine performance:
 - **Pipeline Overrides:** Use WebGPU `override` declarations to specialize constants at pipeline creation time.
 - **Command Encoding:** Optimize `dispatch_workgroups` calls to minimize overhead in multi-pass FFTs.
 
+### Radix-8 DIT Butterfly Reference
+
+A Radix-8 Stockham stage decomposes 8 inputs into two 4-point DFTs on even/odd groups, then combines with W₈ᵏ twiddles:
+
+```
+Inputs x₀…x₇ at Stockham positions. External twiddle: wₖ = exp(-2πi·k/(8p))
+W₈ constants: W₈⁰=1, W₈¹=(1-i)/√2, W₈²=-i, W₈³=-(1+i)/√2
+
+Apply external twiddles to odd group:
+  o₀=x₁·wₖ⁰, o₁=x₃·wₖ¹, o₂=x₅·wₖ², o₃=x₇·wₖ³
+
+4-point DFT of even group (e₀=x₀, e₁=x₂, e₂=x₄, e₃=x₆):
+  E₀=(e₀+e₂)+(e₁+e₃), E₁=(e₀-e₂)-i(e₁-e₃)
+  E₂=(e₀+e₂)-(e₁+e₃), E₃=(e₀-e₂)+i(e₁-e₃)
+
+4-point DFT of odd group similarly → O₀,O₁,O₂,O₃
+
+Apply W₈ᵏ twiddles: O₀*=W₈⁰, O₁*=W₈ᵏ, O₂*=W₈²ᵏ, O₃*=W₈³ᵏ
+
+Combine: y[m] = E[m] + O[m],  y[m+4] = E[m] - O[m]  for m in 0..4
+```
+
+See `src/rivals/claude.rs` (constant `CLAUDE_R8_WGSL`) for the working WGSL implementation.
+
 ## GPU Buffer Limits (Critical for Large N)
 
 wgpu enforces two separate size limits you **must** respect when allocating ping-pong buffers:
@@ -184,27 +268,38 @@ The benchmark input was normalised by N to keep FFT-bin magnitudes O(1) regardle
 
 The normalised input (`t = i/N; Complex::new(t*0.001, sin(2πt)*0.001)`) bounds the DC bin to ≈ N·0.0005 for all N, keeping float32 differences between any two correct algorithms well under 1e-3. **When designing future tests or adding new sizes, verify that max FFT-bin magnitude × 1.2e-7 < VALIDATION_TOLERANCE.**
 
-## Session Status (Claude — Stockham Radix-4/2 Mixed)
+## Session Status (Claude — Stockham Radix-8/4/2 Mixed)
 
-**Result:** All 5 FFT sizes PASS. CI passes.
+**Result:** All 5 FFT sizes PASS. CI passes. **Claude leads the leaderboard at all large N.**
 
-| N | Baseline (MS/s) | Claude (MS/s) | Factor |
-|---|---|---|---|
-| 256 | 5.16 | 5.61 | 1.09× |
-| 1 024 | 5.41 | 5.93 | 1.10× |
-| 16 384 | 5.48 | 5.82 | 1.06× |
-| 65 536 | 5.36 | 5.77 | 1.08× |
-| 1 048 576 | 5.06 | 5.56 | 1.10× |
+Two critical bugs fixed this session vs session 1:
+1. `staging_buf.slice(..)` → `slice(0..out_bytes)`: session-1 code mapped the entire buffer regardless of batch size, producing extra output chunks and `FAIL(inf)` whenever `batch_size < max_batch`.
+2. `force_fallback_adapter: true` hardcoded → now tries hardware first (like Codex), unlocking ~3-10× throughput.
 
-**Achieved ~1.1× over the baseline** for all sizes. The gains are modest because we are running on the software (CPU-fallback) wgpu renderer, where dispatch overhead dominates — the 2× reduction in passes (from log₂N to log₄N) does help, but not by 2× on software.
+| N | Baseline (MS/s) | Claude (MS/s) | Codex (MS/s) | Factor vs Baseline |
+|---|---|---|---|---|
+| 256 | 35–40 | ~160 | ~160 | ~4.5× |
+| 1 024 | 25–26 | ~60–75 | ~68–73 | ~2.5–3× |
+| 16 384 | 24–25 | ~50 | ~47 | ~2× |
+| 65 536 | 22–23 | ~35–40 | ~30–31 | ~1.6× |
+| 1 048 576 | 13–14 | ~30–33 | ~27–28 | ~2.3× |
+
+**Stage counts (radix-8/4/2 vs old radix-4/2):**
+- N=256: 3 stages (was 4)
+- N=1024: 4 stages (was 5)
+- N=16384: 5 stages (was 7)
+- N=65536: 6 stages (was 8)
+- N=1048576: 7 stages (was 10)
 
 **What the next session should try to improve:**
 
-1. **Radix-8 kernel**: reduces passes to log₈N = log₂N/3, stronger at large N.
-2. **Workgroup-local FFT for small N**: for N≤256, do the entire transform in shared memory with one dispatch — eliminates all memory-bandwidth pressure.
-3. **Subgroup shuffles**: skip shared memory for the first few stages, improving occupancy.
-4. **Pipeline override constants**: specialise the shader for each N (constant-fold log_n, unroll loops) using WGSL `override`.
-5. **Request a non-fallback adapter**: `force_fallback_adapter: false` may expose a real GPU on the test machine and unlock significantly higher throughput.
+1. **Workgroup-local FFT for small N (≤1024)**: entire transform in shared memory, one dispatch. Gemini implements this but it's SLOWER on the test GPU (32–38 vs 58–73 MS/s), so the GPU is already fast enough with global-memory passes. Worth testing with fresh eyes.
+2. **Fused multi-stage kernel**: compute 2 radix-4 stages per dispatch using workgroup memory. Reduces global memory round-trips without the complexity of full shared-memory FFT.
+3. **Subgroup shuffles** (`wgpu::Features::SUBGROUP`): exchange data within a wave without shared memory. Guard with runtime feature check.
+4. **Reduce benchmark noise**: current 10 iterations give ~10–15% variance. Consider increasing `BENCH_ITERS` or running multiple sweeps and taking median.
+5. **Radix-16 kernel**: 2 fused radix-4 stages = radix-16. Reduces pass count further and may better utilise register file on modern GPUs.
+
+**Key architecture note:** The mixed-radix stage counter is NOT portable across radices. The radix-4 kernel computes `p = 4^stage`; when used after num_r8 radix-8 stages, the correct stage value is `3*num_r8/2` (integer only when num_r8 is even). This works for all 5 test sizes but would break for N=2048 or N=131072. Future sessions should consider passing `p` directly in the uniform rather than computing it from a stage index.
 
 ## Community Collaboration
 

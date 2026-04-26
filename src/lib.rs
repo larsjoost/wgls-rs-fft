@@ -12,6 +12,8 @@ use num_complex::Complex;
 pub mod benchmark;
 #[cfg(feature = "cuda")]
 mod cufft_wrapper;
+#[cfg(feature = "hipfft")]
+pub mod hipfft_wrapper;
 pub mod rivals;
 #[cfg(feature = "rocm")]
 mod rocfft_wrapper;
@@ -654,5 +656,7 @@ impl Default for GpuFft {
 
 #[cfg(feature = "cuda")]
 pub use cufft_wrapper::CuFft;
+#[cfg(feature = "hipfft")]
+pub use hipfft_wrapper::HipFft;
 #[cfg(feature = "rocm")]
 pub use rocfft_wrapper::RocFft;

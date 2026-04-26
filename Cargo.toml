@@ -27,6 +27,7 @@ rocm-rs = { version = "0.5.1", optional = true }
 default = []
 cuda = ["cufft_rust"]
 rocm = ["rocm-rs"]
+hipfft = []
 
 [dev-dependencies]
 rustfft = "6"
