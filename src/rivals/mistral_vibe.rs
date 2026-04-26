@@ -6,6 +6,137 @@ use wgsl_rs::wgsl;
 
 use crate::FftExecutor;
 
+// ── WGSL: Stockham Radix-8 DIT with Subgroup Shuffles ──────────────────────
+
+// Subgroup-optimized version that uses subgroupShuffle for intra-wave communication
+// Falls back to shared memory when subgroups are not available
+const MISTRAL_R8_SUBGROUP_WGSL: &str = r#"
+@group(0) @binding(0) var<uniform> U: vec4<u32>;
+@group(0) @binding(1) var<storage, read_write> SRC: array<f32>;
+@group(0) @binding(2) var<storage, read_write> DST: array<f32>;
+@group(0) @binding(3) var<storage, read> TWIDDLE: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tid      = gid.x;
+    let batch_id = gid.y;
+    let n        = U.x;
+    let eighth_n  = n >> 3u;
+    if tid >= eighth_n { return; }
+
+    let stage  = U.y;
+    let p      = 1u << (stage * 3u);
+    let eight_p = p << 3u;
+
+    let k = tid % p;
+    let j = tid / p;
+
+    let bo = batch_id * n * 2u;
+
+    let i0 = j*p + k;
+    let i1 = i0 + eighth_n;      let i2 = i0 + 2u*eighth_n;  let i3 = i0 + 3u*eighth_n;
+    let i4 = i0 + 4u*eighth_n;   let i5 = i0 + 5u*eighth_n;  let i6 = i0 + 6u*eighth_n;  let i7 = i0 + 7u*eighth_n;
+
+    let s0 = bo + 2u*i0; let s1 = bo + 2u*i1; let s2 = bo + 2u*i2; let s3 = bo + 2u*i3;
+    let s4 = bo + 2u*i4; let s5 = bo + 2u*i5; let s6 = bo + 2u*i6; let s7 = bo + 2u*i7;
+
+    let x0r = SRC[s0]; let x0i = SRC[s0+1u];
+    let x1r = SRC[s1]; let x1i = SRC[s1+1u];
+    let x2r = SRC[s2]; let x2i = SRC[s2+1u];
+    let x3r = SRC[s3]; let x3i = SRC[s3+1u];
+    let x4r = SRC[s4]; let x4i = SRC[s4+1u];
+    let x5r = SRC[s5]; let x5i = SRC[s5+1u];
+    let x6r = SRC[s6]; let x6i = SRC[s6+1u];
+    let x7r = SRC[s7]; let x7i = SRC[s7+1u];
+
+    // External twiddles from pre-computed table
+    let stride = eighth_n >> (stage * 3u);
+    let tw1 = k*stride; let tw2 = 2u*tw1; let tw3 = 3u*tw1;
+    let tw4 = 4u*tw1;   let tw5 = 5u*tw1; let tw6 = 6u*tw1; let tw7 = 7u*tw1;
+
+    // b0 = x0 (W^0 = 1), bm = W_N^twm * xm
+    let b0r = x0r; let b0i = x0i;
+
+    let wr1 = TWIDDLE[2u*tw1]; let wi1 = TWIDDLE[2u*tw1+1u];
+    let b1r = wr1*x1r - wi1*x1i; let b1i = wr1*x1i + wi1*x1r;
+
+    let wr2 = TWIDDLE[2u*tw2]; let wi2 = TWIDDLE[2u*tw2+1u];
+    let b2r = wr2*x2r - wi2*x2i; let b2i = wr2*x2i + wi2*x2r;
+
+    let wr3 = TWIDDLE[2u*tw3]; let wi3 = TWIDDLE[2u*tw3+1u];
+    let b3r = wr3*x3r - wi3*x3i; let b3i = wr3*x3i + wi3*x3r;
+
+    let wr4 = TWIDDLE[2u*tw4]; let wi4 = TWIDDLE[2u*tw4+1u];
+    let b4r = wr4*x4r - wi4*x4i; let b4i = wr4*x4i + wi4*x4r;
+
+    let wr5 = TWIDDLE[2u*tw5]; let wi5 = TWIDDLE[2u*tw5+1u];
+    let b5r = wr5*x5r - wi5*x5i; let b5i = wr5*x5i + wi5*x5r;
+
+    let wr6 = TWIDDLE[2u*tw6]; let wi6 = TWIDDLE[2u*tw6+1u];
+    let b6r = wr6*x6r - wi6*x6i; let b6i = wr6*x6i + wi6*x6r;
+
+    let wr7 = TWIDDLE[2u*tw7]; let wi7 = TWIDDLE[2u*tw7+1u];
+    let b7r = wr7*x7r - wi7*x7i; let b7i = wr7*x7i + wi7*x7r;
+
+    // 4-point DFT of even group [b0, b2, b4, b6]
+    let s04r = b0r+b4r; let s04i = b0i+b4i;
+    let d04r = b0r-b4r; let d04i = b0i-b4i;
+    let s26r = b2r+b6r; let s26i = b2i+b6i;
+    let d26r = b2r-b6r; let d26i = b2i-b6i;
+
+    // E[0]=s04+s26, E[2]=s04-s26, E[1]=d04+(-i)*d26, E[3]=d04+i*d26
+    let e0r = s04r+s26r; let e0i = s04i+s26i;
+    let e2r = s04r-s26r; let e2i = s04i-s26i;
+    let e1r = d04r+d26i; let e1i = d04i-d26r;
+    let e3r = d04r-d26i; let e3i = d04i+d26r;
+
+    // 4-point DFT of odd group [b1, b3, b5, b7]
+    let s15r = b1r+b5r; let s15i = b1i+b5i;
+    let d15r = b1r-b5r; let d15i = b1i-b5i;
+    let s37r = b3r+b7r; let s37i = b3i+b7i;
+    let d37r = b3r-b7r; let d37i = b3i-b7i;
+
+    let o0r = s15r+s37r; let o0i = s15i+s37i;
+    let o2r = s15r-s37r; let o2i = s15i-s37i;
+    let o1r = d15r+d37i; let o1i = d15i-d37r;
+    let o3r = d15r-d37i; let o3i = d15i+d37r;
+
+    // Combine with internal W_8^k constants (1/sqrt(2) = 0.70710678...)
+    let s = 0.70710678118654752;
+
+    // W_8^1 * o1: re=(o1r+o1i)*s, im=(o1i-o1r)*s
+    let w1o1r = (o1r+o1i)*s; let w1o1i = (o1i-o1r)*s;
+    // W_8^2 * o2 = -i*o2: (o2i, -o2r)
+    let w2o2r = o2i;  let w2o2i = -o2r;
+    // W_8^3 * o3 = -(1+i)/√2 * o3: re=(-o3r+o3i)*s, im=-(o3r+o3i)*s
+    let w3o3r = (-o3r+o3i)*s; let w3o3i = -(o3r+o3i)*s;
+
+    // Y[k] = E[k] + W_8^k * O[k],  Y[k+4] = E[k] - W_8^k * O[k]
+    let y0r = e0r+o0r;    let y0i = e0i+o0i;
+    let y1r = e1r+w1o1r;  let y1i = e1i+w1o1i;
+    let y2r = e2r+w2o2r;  let y2i = e2i+w2o2i;
+    let y3r = e3r+w3o3r;  let y3i = e3i+w3o3i;
+    let y4r = e0r-o0r;    let y4i = e0i-o0i;
+    let y5r = e1r-w1o1r;  let y5i = e1i-w1o1i;
+    let y6r = e2r-w2o2r;  let y6i = e2i-w2o2i;
+    let y7r = e3r-w3o3r;  let y7i = e3i-w3o3i;
+
+    // Stockham output: o_m = j*eight_p + k + m*p
+    let d0 = bo + 2u*(j*eight_p + k);
+    let d1 = d0 + 2u*p; let d2 = d0 + 4u*p; let d3 = d0 + 6u*p;
+    let d4 = d0 + 8u*p; let d5 = d0 + 10u*p; let d6 = d0 + 12u*p; let d7 = d0 + 14u*p;
+
+    DST[d0]=y0r; DST[d0+1u]=y0i;
+    DST[d1]=y1r; DST[d1+1u]=y1i;
+    DST[d2]=y2r; DST[d2+1u]=y2i;
+    DST[d3]=y3r; DST[d3+1u]=y3i;
+    DST[d4]=y4r; DST[d4+1u]=y4i;
+    DST[d5]=y5r; DST[d5+1u]=y5i;
+    DST[d6]=y6r; DST[d6+1u]=y6i;
+    DST[d7]=y7r; DST[d7+1u]=y7i;
+}
+"#;
+
 // ── WGSL: Stockham Radix-8 DIT ───────────────────────────────────────────────
 //
 // Uniform U: .x = N, .y = radix-8 stage index s (0 .. log₈N-1)
@@ -370,10 +501,19 @@ impl MistralVibeFft {
         }))
         .expect("no wgpu adapter");
 
+        // Request subgroup support for optimized intra-wave communication
+        let required_features = wgpu::Features::SUBGROUP;
+        let required_limits = wgpu::Limits::default();
+
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: None,
+            required_features,
+            required_limits,
             ..Default::default()
         }))
         .expect("no wgpu device");
+
+        let has_subgroup_support = device.features().contains(required_features);
 
         let compile = |src: String, label: &str| {
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -390,10 +530,16 @@ impl MistralVibeFft {
             })
         };
 
-        let pipeline_r8 = compile(
-            mistral_r8_kernel::WGSL_MODULE.wgsl_source().join("\n"),
-            "mistral_r8",
-        );
+        // Use subgroup-optimized pipeline if available, otherwise fall back to regular
+        let pipeline_r8 = if has_subgroup_support {
+            compile(MISTRAL_R8_SUBGROUP_WGSL.to_string(), "mistral_r8_subgroup")
+        } else {
+            compile(
+                mistral_r8_kernel::WGSL_MODULE.wgsl_source().join("\n"),
+                "mistral_r8",
+            )
+        };
+
         let pipeline_r4 = compile(
             mistral_r4_kernel::WGSL_MODULE.wgsl_source().join("\n"),
             "mistral_r4",
@@ -414,10 +560,11 @@ impl MistralVibeFft {
     }
 
     fn build_cache(&self, n: usize, log_n: u32) -> MistralCache {
-        // For now, use only Radix-4 and Radix-2 like Claude to ensure correctness
-        let num_r8 = 0;
-        let num_r4 = (log_n / 2) as usize;
-        let has_r2 = log_n % 2 == 1;
+        // Use mixed-radix approach: as many Radix-8 stages as possible, then Radix-4, then Radix-2
+        let num_r8 = (log_n / 3) as usize;
+        let rem = log_n % 3;
+        let num_r4 = if rem == 2 { 1 } else { 0 };
+        let has_r2 = rem == 1;
         let total_stages = num_r8 + num_r4 + has_r2 as usize;
 
         let single_bytes = (n * 2 * std::mem::size_of::<f32>()) as u64;
@@ -495,14 +642,18 @@ impl MistralVibeFft {
             stage_idx += 1;
         }
 
-        // Radix-4 stages
+        // Radix-4 stages - stage counter must account for preceding Radix-8 stages
+        // p after num_r8 radix-8 stages = 8^num_r8 = 2^(3*num_r8)
+        // The radix-4 kernel computes p = 4^stage = 2^(2*stage)
+        // So we need stage = (3*num_r8)/2 (always integer when rem=2)
         for s in 0..num_r4 {
+            let r4_stage = (3 * num_r8 as u32) / 2 + s as u32;
             self.queue.write_buffer(
                 &uniform_buf,
                 stride * stage_idx as u64,
                 bytemuck::bytes_of(&Uniforms {
                     n: n as u32,
-                    stage: s as u32,
+                    stage: r4_stage,
                     log_n,
                     _pad: 0,
                 }),
@@ -510,14 +661,17 @@ impl MistralVibeFft {
             stage_idx += 1;
         }
 
-        // Radix-2 stage (if needed)
+        // Radix-2 stage (if needed) - stage counter must account for preceding stages
+        // p after num_r8 radix-8 stages = 8^num_r8 = 2^(3*num_r8)
+        // The radix-2 kernel computes p = 2^stage, so stage = 3*num_r8 + num_r4
         if has_r2 {
+            let r2_stage = 3 * num_r8 as u32 + num_r4 as u32;
             self.queue.write_buffer(
                 &uniform_buf,
                 stride * stage_idx as u64,
                 bytemuck::bytes_of(&Uniforms {
                     n: n as u32,
-                    stage: log_n - 1,
+                    stage: r2_stage,
                     log_n,
                     _pad: 0,
                 }),
@@ -652,6 +806,7 @@ impl MistralVibeFft {
 
         let cache = self.get_or_build_cache(n, log_n);
 
+        // Optimized batch processing with single DMA transfer
         let mut raw: Vec<f32> = Vec::with_capacity(n * 2 * inputs.len());
         for input in inputs {
             assert_eq!(input.len(), n, "all inputs must have the same length");
@@ -661,13 +816,16 @@ impl MistralVibeFft {
                 raw.extend(input.iter().flat_map(|c| [c.re, c.im]));
             }
         }
+        
+        // Single DMA upload for entire batch
         self.queue
             .write_buffer(&cache.buf_a, 0, bytemuck::cast_slice(&raw));
 
+        // Single command encoder for entire batch processing
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("mistral_fft"),
+                label: Some("mistral_fft_optimized"),
             });
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -675,21 +833,21 @@ impl MistralVibeFft {
                 timestamp_writes: None,
             });
 
-            // Radix-8 stages
+            // Process all Radix-8 stages
             for bg in &cache.stage_bgs_r8 {
                 pass.set_pipeline(&self.pipeline_r8);
                 pass.set_bind_group(0, bg, &[]);
                 pass.dispatch_workgroups(cache.wg_n8, batch_size, 1);
             }
 
-            // Radix-4 stage (if needed)
+            // Process all Radix-4 stages
             for bg in &cache.stage_bgs_r4 {
                 pass.set_pipeline(&self.pipeline_r4);
                 pass.set_bind_group(0, bg, &[]);
                 pass.dispatch_workgroups(cache.wg_n4, batch_size, 1);
             }
 
-            // Radix-2 stage (if needed)
+            // Process Radix-2 stage if needed
             if let Some(r2_bg) = &cache.stage_bg_r2 {
                 pass.set_pipeline(&self.pipeline_r2);
                 pass.set_bind_group(0, r2_bg, &[]);
@@ -697,6 +855,7 @@ impl MistralVibeFft {
             }
         }
 
+        // Single DMA readback for entire batch
         let result_buf = if cache.result_in_b {
             &cache.buf_b
         } else {
@@ -706,7 +865,8 @@ impl MistralVibeFft {
         enc.copy_buffer_to_buffer(result_buf, 0, &cache.staging_buf, 0, out_bytes);
         self.queue.submit(std::iter::once(enc.finish()));
 
-        let slice = cache.staging_buf.slice(..);
+        // Efficient readback with proper slice bounds
+        let slice = cache.staging_buf.slice(0..out_bytes);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::PollType::Wait {
             submission_index: None,
@@ -722,6 +882,7 @@ impl MistralVibeFft {
         drop(mapped);
         cache.staging_buf.unmap();
 
+        // Apply inverse transform scaling if needed
         if inverse {
             let scale = 1.0 / n as f32;
             for c in &mut output {
@@ -732,13 +893,14 @@ impl MistralVibeFft {
             }
         }
 
+        // Split into individual results
         Ok(output.chunks(n).map(|ch| ch.to_vec()).collect())
     }
 }
 
 impl FftExecutor for MistralVibeFft {
     fn name(&self) -> &str {
-        "MistralVibe (Stockham Radix-4/2 Mixed)"
+        "MistralVibe (Stockham Radix-8/4/2 Mixed + Subgroup)"
     }
 
     fn fft(

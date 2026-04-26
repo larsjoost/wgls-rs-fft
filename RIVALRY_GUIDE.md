@@ -10,6 +10,7 @@ Use rocFFT open source code as inspiration
 1. **Read `REQUIREMENTS.md`:** Contains the optimization roadmap — Mixed-Radix, Subgroup Shuffles, Stockham vs. Cooley-Tukey, workgroup dispatch strategies.
 2. **Analyze the Baseline:** Read `src/shaders.rs` and `src/rivals/mod.rs` to understand the existing Radix-2 implementation and the `FftExecutor` trait.
 3. **Platform Support:** Implementations must only support Linux. Cross-platform compatibility is not required.
+4. **Innovation**: Implement at least one advanced optimization technique
 
 ## Known Pitfalls
 
