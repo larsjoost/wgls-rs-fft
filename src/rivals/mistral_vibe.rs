@@ -816,7 +816,7 @@ impl MistralVibeFft {
                 raw.extend(input.iter().flat_map(|c| [c.re, c.im]));
             }
         }
-        
+
         // Single DMA upload for entire batch
         self.queue
             .write_buffer(&cache.buf_a, 0, bytemuck::cast_slice(&raw));
