@@ -56,7 +56,7 @@ pub fn benchmark_gpu_only(
 ) -> Result<GpuOnlyResult, Box<dyn std::error::Error>> {
     let log_n = n.trailing_zeros();
     let sc = gpu_fft.get_or_build_size_cache(n, log_n);
-    
+
     // Prepare input data and upload to GPU (this is part of setup, not measured)
     let inputs: Vec<Vec<Complex<f32>>> = (0..batch_size)
         .map(|_| {
@@ -77,17 +77,13 @@ pub fn benchmark_gpu_only(
     }
 
     // Upload to GPU (this is part of setup, not measured)
-    gpu_fft.queue()
+    gpu_fft
+        .queue()
         .write_buffer(&sc.buf_a, 0, bytemuck::cast_slice(&all_raw_data));
 
     // Benchmark only the GPU compute + DMA operations
-    let gpu_duration_sec = gpu_fft.benchmark_gpu_only(
-        &sc,
-        batch_size as u32,
-        n,
-        GPU_WARMUP_ITERS,
-        GPU_BENCH_ITERS,
-    )?;
+    let gpu_duration_sec =
+        gpu_fft.benchmark_gpu_only(&sc, batch_size as u32, n, GPU_WARMUP_ITERS, GPU_BENCH_ITERS)?;
 
     let total_samples = (n * batch_size) as f64;
     let gpu_msamples_per_sec = total_samples / gpu_duration_sec / 1_000_000.0;
@@ -139,7 +135,8 @@ pub fn benchmark_gpu_pipeline(
 
     let total_samples = (n * batch_size) as f64;
     let gpu_msamples_per_sec = total_samples / duration.as_secs_f64() / 1_000_000.0;
-    let gpu_gflops = 5.0 * total_samples * (n as f64).log2() / duration.as_secs_f64() / 1_000_000_000.0;
+    let gpu_gflops =
+        5.0 * total_samples * (n as f64).log2() / duration.as_secs_f64() / 1_000_000_000.0;
 
     Ok(GpuOnlyResult {
         rival_name: rival.name().to_string(),
@@ -268,24 +265,33 @@ mod tests {
         // This test verifies that the GPU-only benchmark function works
         // without panicking and returns reasonable values
         let gpu_fft = GpuFft::new().expect("Failed to create GpuFft");
-        
+
         // Use a small size for quick testing
         let n = 256;
         let batch_size = 4;
-        
+
         let result = benchmark_gpu_only(&gpu_fft, n, batch_size);
-        
+
         assert!(result.is_ok(), "GPU-only benchmark should succeed");
         let result = result.unwrap();
-        
+
         // Basic sanity checks
         assert_eq!(result.n, n);
         assert_eq!(result.batch_size, batch_size);
-        assert!(result.gpu_duration_sec > 0.0, "GPU duration should be positive");
-        assert!(result.gpu_msamples_per_sec > 0.0, "Throughput should be positive");
+        assert!(
+            result.gpu_duration_sec > 0.0,
+            "GPU duration should be positive"
+        );
+        assert!(
+            result.gpu_msamples_per_sec > 0.0,
+            "Throughput should be positive"
+        );
         assert!(result.gpu_gflops > 0.0, "GFLOPS should be positive");
-        
+
         // Duration should be reasonable (less than 1 second per iteration)
-        assert!(result.gpu_duration_sec < 1.0, "GPU duration should be reasonable");
+        assert!(
+            result.gpu_duration_sec < 1.0,
+            "GPU duration should be reasonable"
+        );
     }
 }

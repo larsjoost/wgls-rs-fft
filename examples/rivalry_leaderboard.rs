@@ -1,6 +1,9 @@
 use std::process::Command;
 use wgls_rs_fft::{
-    benchmark::{benchmark_gpu_pipeline, benchmark_rival, GpuOnlyResult, ValidationOutcome, MAX_TOTAL_SAMPLES},
+    benchmark::{
+        benchmark_gpu_pipeline, benchmark_rival, GpuOnlyResult, ValidationOutcome,
+        MAX_TOTAL_SAMPLES,
+    },
     FftExecutor, GpuFft,
 };
 
@@ -104,6 +107,9 @@ fn main() {
     ));
     rivals.push(Box::new(wgls_rs_fft::rivals::claude::ClaudeFft::new()));
     rivals.push(Box::new(wgls_rs_fft::rivals::codex::CodexFft::new()));
+    rivals.push(Box::new(
+        wgls_rs_fft::rivals::devstral_2::Devstral2Fft::new(),
+    ));
     rivals.push(Box::new(wgls_rs_fft::rivals::gemini::GeminiFft::new()));
     rivals.push(Box::new(
         wgls_rs_fft::rivals::mistral_vibe::MistralVibeFft::new(),
@@ -133,7 +139,7 @@ fn main() {
         for rival in &rivals {
             // Try to get GPU-only performance for GPU implementations
             let gpu_result = try_get_gpu_performance(rival.as_ref(), n, batch_size);
-            
+
             if let Some(gpu_result) = gpu_result {
                 // Also run full benchmark for validation
                 let full_result = benchmark_rival(rival.as_ref(), &reference, n, batch_size);
@@ -166,8 +172,6 @@ fn main() {
                 );
             }
         }
-
-
     }
 
     println!("\nAdd your implementation to src/rivals/ and register it above to compete.");

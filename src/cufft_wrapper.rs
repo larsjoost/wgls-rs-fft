@@ -27,7 +27,7 @@ impl FftExecutor for CuFft {
     fn ifft(&self, inputs: &[Vec<Complex<f32>>]) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn Error>> {
         self.batch_ifft(inputs)
     }
-    
+
     fn as_any(&self) -> &dyn Any {
         self
     }

@@ -38,7 +38,7 @@ pub trait FftExecutor {
         &self,
         inputs: &[Vec<Complex<f32>>],
     ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>>;
-    
+
     /// Get a reference to the underlying type for downcasting.
     fn as_any(&self) -> &dyn Any;
 }
@@ -55,13 +55,13 @@ pub trait GpuFftTrait {
         warmup_iters: usize,
         bench_iters: usize,
     ) -> Result<f64, Box<dyn std::error::Error>>;
-    
+
     /// Get or build size-specific GPU resources.
     fn get_or_build_size_cache(&self, n: usize, log_n: u32) -> SizeCache;
-    
+
     /// Prepare input data for GPU processing, applying conjugation for IFFT if needed.
     fn prepare_input_data(&self, input: &[Complex<f32>], inverse: bool) -> Vec<f32>;
-    
+
     /// Get the queue for GPU operations.
     fn queue(&self) -> &wgpu::Queue;
 }
@@ -91,7 +91,7 @@ impl FftExecutor for GpuFft {
     ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>> {
         self.transform_batch_internal(inputs, true)
     }
-    
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -107,7 +107,7 @@ impl GpuFftTrait for GpuFft {
         bench_iters: usize,
     ) -> Result<f64, Box<dyn std::error::Error>> {
         use std::time::Instant;
-        
+
         // Warmup
         for _ in 0..warmup_iters {
             self.execute_compute_pass(sc, batch_size, n);
@@ -123,25 +123,25 @@ impl GpuFftTrait for GpuFft {
         for _ in 0..bench_iters {
             self.execute_compute_pass(sc, batch_size, n);
         }
-        
+
         // Wait for all submissions to complete
         self.device.poll(wgpu::PollType::Wait {
             submission_index: None,
             timeout: None,
         })?;
-        
+
         let duration = start.elapsed();
         Ok(duration.as_secs_f64() / bench_iters as f64)
     }
-    
+
     fn get_or_build_size_cache(&self, n: usize, log_n: u32) -> SizeCache {
         self.get_or_build_size_cache(n, log_n)
     }
-    
+
     fn prepare_input_data(&self, input: &[Complex<f32>], inverse: bool) -> Vec<f32> {
         self.prepare_input_data(input, inverse)
     }
-    
+
     fn queue(&self) -> &wgpu::Queue {
         &self.queue
     }
@@ -608,7 +608,7 @@ impl GpuFft {
         bench_iters: usize,
     ) -> Result<f64, Box<dyn std::error::Error>> {
         use std::time::Instant;
-        
+
         // Warmup
         for _ in 0..warmup_iters {
             self.execute_compute_pass(sc, batch_size, n);
@@ -624,13 +624,13 @@ impl GpuFft {
         for _ in 0..bench_iters {
             self.execute_compute_pass(sc, batch_size, n);
         }
-        
+
         // Wait for all submissions to complete
         self.device.poll(wgpu::PollType::Wait {
             submission_index: None,
             timeout: None,
         })?;
-        
+
         let duration = start.elapsed();
         Ok(duration.as_secs_f64() / bench_iters as f64)
     }

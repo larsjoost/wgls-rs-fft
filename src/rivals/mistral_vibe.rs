@@ -917,7 +917,7 @@ impl FftExecutor for MistralVibeFft {
     ) -> Result<Vec<Vec<Complex<f32>>>, Box<dyn std::error::Error>> {
         self.transform_batch_internal(inputs, true)
     }
-    
+
     fn as_any(&self) -> &dyn Any {
         self
     }
