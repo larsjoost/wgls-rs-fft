@@ -301,6 +301,8 @@ Key improvements this session:
 3. **Radix-16 or higher**: Explore higher radices to further reduce pass counts.
 4. **JIT Specialization**: Generate distinct WGSL shaders per FFT size to enable loop unrolling and constant folding.
 5. **Reduced Readback**: Profile if asynchronous readback can be further optimized.
+6. **SIMD**: Use single instruction multiple data everywhere possible
+7. **Local memory**: Optimize memory bandwidth by using local memory
 
 **Key architecture note:** Passing `p` directly in the uniform buffer is highly recommended for mixed-radix stability. Also, avoid `enable subgroups;` in WGSL for now as it causes validation errors in current wgpu/Naga.
 
