@@ -132,3 +132,104 @@ fn main() {
 
     println!("\nExample completed successfully!");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_complex::Complex;
+
+    // ── apply_hann_window (pure) ──────────────────────────────────────────────
+
+    #[test]
+    fn hann_window_zeros_endpoints() {
+        let n = 64;
+        let mut sig: Vec<Complex<f32>> = vec![Complex::new(1.0, 1.0); n];
+        apply_hann_window(&mut sig);
+        // w(0) = 0.5*(1 - cos(0)) = 0
+        assert!(sig[0].norm() < 1e-6, "first sample should be ~0 after Hann");
+        // w(n-1) = 0.5*(1 - cos(2π)) = 0
+        assert!(
+            sig[n - 1].norm() < 1e-6,
+            "last sample should be ~0 after Hann"
+        );
+    }
+
+    #[test]
+    fn hann_window_peak_at_midpoint() {
+        let n = 65; // odd so n/2 is exact middle
+        let mut sig: Vec<Complex<f32>> = vec![Complex::new(1.0, 0.0); n];
+        apply_hann_window(&mut sig);
+        // w(n/2) = 0.5*(1 - cos(π)) = 1.0
+        assert!(
+            (sig[n / 2].re - 1.0).abs() < 1e-5,
+            "midpoint should be ~1 after Hann, got {}",
+            sig[n / 2].re
+        );
+    }
+
+    #[test]
+    fn hann_window_preserves_length() {
+        let n = 128;
+        let mut sig: Vec<Complex<f32>> = vec![Complex::new(0.5, 0.5); n];
+        apply_hann_window(&mut sig);
+        assert_eq!(sig.len(), n);
+    }
+
+    // ── generate_test_signal (pure) ───────────────────────────────────────────
+
+    #[test]
+    fn test_signal_length() {
+        assert_eq!(generate_test_signal(256).len(), 256);
+        assert_eq!(generate_test_signal(1024).len(), 1024);
+    }
+
+    #[test]
+    fn test_signal_is_real() {
+        for s in generate_test_signal(64) {
+            assert_eq!(s.im, 0.0, "test signal should have zero imaginary part");
+        }
+    }
+
+    #[test]
+    fn test_signal_bounded() {
+        for s in generate_test_signal(512) {
+            assert!(s.re.abs() <= 1.0 + 1e-6, "signal amplitude out of [-1,1]");
+        }
+    }
+
+    // ── compute_power_spectrum (pure) ─────────────────────────────────────────
+
+    #[test]
+    fn power_spectrum_non_negative() {
+        let input: Vec<Complex<f32>> = (0..64)
+            .map(|i| Complex::new(i as f32, -(i as f32)))
+            .collect();
+        for p in compute_power_spectrum(&input) {
+            assert!(p >= 0.0, "power spectrum must be non-negative");
+        }
+    }
+
+    #[test]
+    fn power_spectrum_length() {
+        let n = 128;
+        let input: Vec<Complex<f32>> = vec![Complex::new(1.0, 0.0); n];
+        assert_eq!(compute_power_spectrum(&input).len(), n);
+    }
+
+    // ── GPU: FFT → IFFT roundtrip ─────────────────────────────────────────────
+
+    #[test]
+    fn fft_ifft_roundtrip() {
+        let fft = GpuFft::new().expect("GPU required");
+        let mut signal = generate_test_signal(256);
+        apply_hann_window(&mut signal);
+        let spectrum = fft.fft(&[signal.clone()]).expect("fft failed");
+        let recon = fft.ifft(&spectrum).expect("ifft failed");
+        let max_err = signal
+            .iter()
+            .zip(recon[0].iter())
+            .map(|(a, b)| (a - b).norm())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 1e-3, "roundtrip error {max_err:.2e} exceeds 1e-3");
+    }
+}

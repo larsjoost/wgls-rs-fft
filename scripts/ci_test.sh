@@ -80,6 +80,20 @@ fi
 
 echo "✅ All cargo tests passed"
 
+# Run unit tests embedded in example files
+section "Running example unit tests (single-threaded)"
+echo "Running: cargo test --examples -- --test-threads=1"
+
+cargo test --examples -- --test-threads=1
+EXAMPLE_TEST_RESULT=$?
+
+if [ $EXAMPLE_TEST_RESULT -ne 0 ]; then
+    echo "❌ Example tests failed with exit code $EXAMPLE_TEST_RESULT"
+    exit $EXAMPLE_TEST_RESULT
+fi
+
+echo "✅ All example tests passed"
+
 # Check formatting
 section "Checking code formatting"
 echo "Running: cargo fmt --check"

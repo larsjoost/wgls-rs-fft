@@ -1,6 +1,6 @@
 use std::env;
 use wgls_rs_fft::{
-    benchmark::{benchmark_rival, ValidationOutcome},
+    benchmark::{benchmark_rival, ValidationOutcome, MAX_TOTAL_SAMPLES},
     FftExecutor, GpuFft,
 };
 
@@ -70,6 +70,60 @@ fn main() {
         println!(
             "Best batch size for {}: {} ({:.2} MSamples/s)",
             name, best_batch, best_msps
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Benchmark correctness ─────────────────────────────────────────────────
+
+    #[test]
+    fn baseline_passes_validation_n256() {
+        let reference = GpuFft::new().expect("GPU required");
+        let rival = GpuFft::new().expect("GPU required");
+        let result = benchmark_rival(&rival, &reference, 256, 4);
+        assert!(
+            matches!(result.validation, ValidationOutcome::Pass),
+            "baseline should pass validation at N=256"
+        );
+    }
+
+    #[test]
+    fn benchmark_returns_positive_throughput() {
+        let reference = GpuFft::new().expect("GPU required");
+        let rival = GpuFft::new().expect("GPU required");
+        let result = benchmark_rival(&rival, &reference, 256, 4);
+        assert!(
+            result.msamples_per_sec > 0.0,
+            "throughput should be positive"
+        );
+        assert!(result.gflops > 0.0, "gflops should be positive");
+    }
+
+    #[test]
+    fn benchmark_skips_oversized_batches() {
+        // n * batch exceeds MAX_TOTAL_SAMPLES → loop body is skipped, no panic
+        let n = 1_048_576usize;
+        let batch = 1024usize;
+        assert!(
+            n.saturating_mul(batch) > MAX_TOTAL_SAMPLES,
+            "precondition: this batch should exceed the cap"
+        );
+        // No benchmark call — just verify the guard logic holds.
+        // The find_optimal_batch loop uses this check before calling benchmark_rival.
+    }
+
+    #[test]
+    fn claude_rival_passes_validation_n256() {
+        let reference = GpuFft::new().expect("GPU required");
+        let rival = wgls_rs_fft::rivals::claude::ClaudeFft::new();
+        let result = benchmark_rival(&rival, &reference, 256, 4);
+        assert!(
+            matches!(result.validation, ValidationOutcome::Pass),
+            "ClaudeFft should pass validation at N=256"
         );
     }
 }

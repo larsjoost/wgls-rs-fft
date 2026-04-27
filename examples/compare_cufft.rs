@@ -119,3 +119,81 @@ fn main() {
         println!("\nROCm support not compiled (add --features rocm to enable, AMD GPUs only)");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use num_complex::Complex;
+    use wgls_rs_fft::GpuFft;
+
+    fn make_fft() -> GpuFft {
+        GpuFft::new().expect("GPU required")
+    }
+
+    // ── WebGPU correctness ────────────────────────────────────────────────────
+
+    #[test]
+    fn wgpu_impulse_flat_spectrum() {
+        let fft = make_fft();
+        let n = 256;
+        let mut impulse = vec![Complex::<f32>::new(0.0, 0.0); n];
+        impulse[0] = Complex::new(1.0, 0.0);
+        let out = fft.fft(&[impulse]).expect("fft failed");
+        for (k, c) in out[0].iter().enumerate() {
+            let mag = c.norm();
+            assert!(
+                (mag - 1.0).abs() < 1e-3,
+                "bin {k} magnitude {mag:.4} should be ~1 for impulse"
+            );
+        }
+    }
+
+    #[test]
+    fn wgpu_roundtrip_n1024() {
+        let fft = make_fft();
+        let n = 1024;
+        let input: Vec<Vec<Complex<f32>>> = vec![(0..n)
+            .map(|i| Complex::new((i as f32 / n as f32).sin() * 0.001, 0.0))
+            .collect()];
+        let freq = fft.fft(&input).expect("fft failed");
+        let recon = fft.ifft(&freq).expect("ifft failed");
+        let max_err = input[0]
+            .iter()
+            .zip(recon[0].iter())
+            .map(|(a, b)| (a - b).norm())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 1e-3, "roundtrip error {max_err:.2e} at N=1024");
+    }
+
+    #[test]
+    fn wgpu_output_length_matches_input() {
+        let fft = make_fft();
+        for &n in &[64usize, 256, 1024] {
+            let input = vec![vec![Complex::new(1.0f32, 0.0); n]];
+            let out = fft.fft(&input).expect("fft failed");
+            assert_eq!(out[0].len(), n);
+        }
+    }
+
+    // ── cuFFT (feature-gated) ─────────────────────────────────────────────────
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cufft_matches_wgpu_n256() {
+        use wgls_rs_fft::CuFft;
+        let n = 256;
+        let cufft = match CuFft::new(n) {
+            Ok(c) => c,
+            Err(_) => return, // cuFFT unavailable at runtime, skip
+        };
+        let wgpu = make_fft();
+        let input: Vec<Vec<Complex<f32>>> = vec![(0..n)
+            .map(|i| Complex::new(i as f32 * 0.001, 0.0))
+            .collect()];
+        let wgpu_out = wgpu.fft(&input).expect("wgpu fft failed");
+        let cufft_out = cufft.fft(&input).expect("cufft fft failed");
+        for (k, (a, b)) in wgpu_out[0].iter().zip(cufft_out[0].iter()).enumerate() {
+            let err = (a - b).norm();
+            assert!(err < 1e-2, "bin {k}: wgpu vs cufft diff {err:.2e}");
+        }
+    }
+}

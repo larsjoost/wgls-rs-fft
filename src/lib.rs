@@ -1,9 +1,10 @@
 //! GPU-accelerated FFT using [wgpu](https://github.com/gfx-rs/wgpu) compute shaders.
 //!
-//! Implements the **Stockham autosort** radix-2 FFT — a two-buffer ping-pong formulation
+//! Implements the **Stockham autosort** Radix-4/2 FFT — a two-buffer ping-pong formulation
 //! where each stage reads from one buffer and writes to the other. This eliminates the separate
-//! bit-reversal pass and removes all inter-stage memory hazards, allowing the entire transform
-//! to run in a single GPU compute pass with one `queue.submit()` call.
+//! bit-reversal pass and removes all inter-stage memory hazards. The baseline dispatches
+//! ⌊log₄N⌋ Radix-4 passes (plus one Radix-2 pass when log₂N is odd), halving the pass count
+//! vs the old Radix-2 baseline for a significant throughput improvement.
 
 use std::num::NonZeroU64;
 
@@ -70,12 +71,14 @@ pub struct GpuFft {
     device: wgpu::Device,
     pub queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    /// Present only when created via `new()` (R4 mode). `None` in legacy `with_shader` mode.
+    pipeline_r2: Option<wgpu::ComputePipeline>,
     cache: RefCell<std::collections::HashMap<usize, SizeCache>>,
 }
 
 impl FftExecutor for GpuFft {
     fn name(&self) -> &str {
-        "Baseline (Stockham Radix-2)"
+        "Baseline (Stockham Radix-4/2)"
     }
 
     fn fft(
@@ -225,13 +228,19 @@ pub struct SizeCache {
     buf_a: wgpu::Buffer,
     buf_b: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
-    #[allow(dead_code)] // Used in shader but not directly accessed in Rust code
+    #[allow(dead_code)]
     twiddle_buf: wgpu::Buffer,
-    #[allow(dead_code)] // Kept for potential future use
+    #[allow(dead_code)]
     data_bytes: u64,
+    /// R4 stages (R4 mode) or R2 stages (legacy with_shader mode).
     stage_bgs: Vec<wgpu::BindGroup>,
+    /// Final R2 stage when log₂N is odd (R4 mode only).
+    stage_bg_r2: Option<wgpu::BindGroup>,
     result_in_b: bool,
+    /// Workgroup count for the main-stage dispatch (N/4 in R4 mode, N/2 in legacy mode).
     wg_n2: u32,
+    /// Workgroup count for R4 dispatch (N/4). 0 in legacy mode.
+    wg_r4: u32,
 }
 
 /// Uniforms passed to the compute shader (16-byte aligned).
@@ -245,10 +254,20 @@ struct FftUniforms {
 }
 
 impl GpuFft {
-    /// Create a new [`GpuFft`].
+    /// Access the underlying wgpu device.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// Access the compiled compute pipeline.
+    pub fn compute_pipeline(&self) -> &wgpu::ComputePipeline {
+        &self.pipeline
+    }
+
+    /// Create a new [`GpuFft`] using the Radix-4/2 Stockham baseline.
     ///
-    /// Attempts to acquire a GPU adapter via wgpu, with CPU fallback enabled.
-    /// Uses GPU acceleration when available, otherwise falls back to software rendering.
+    /// Dispatches ⌊log₄N⌋ Radix-4 passes (+ one Radix-2 pass when log₂N is odd),
+    /// halving the pass count vs the old Radix-2 baseline.
     ///
     /// # Examples
     ///
@@ -259,10 +278,50 @@ impl GpuFft {
     /// // Now use fft.fft() and fft.ifft()
     /// ```
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Self::with_shader(
-            shaders::stockham::WGSL_MODULE.wgsl_source().join("\n"),
-            "stockham_baseline",
-        )
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .or_else(|_| {
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: true,
+            }))
+        })?;
+
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                ..Default::default()
+            }))?;
+
+        let compile = |src: &str, label: &str| {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(&format!("{label}_pipeline")),
+                layout: None,
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+
+        let pipeline = compile(shaders::R4_WGSL, "stockham_r4");
+        let pipeline_r2 = Some(compile(shaders::R2_WGSL, "stockham_r2"));
+
+        Ok(Self {
+            device,
+            queue,
+            pipeline,
+            pipeline_r2,
+            cache: RefCell::new(std::collections::HashMap::new()),
+        })
     }
 
     /// Create a new [`GpuFft`] with a custom WGSL shader.
@@ -308,6 +367,7 @@ impl GpuFft {
             device,
             queue,
             pipeline,
+            pipeline_r2: None, // legacy single-pipeline mode
             cache: RefCell::new(std::collections::HashMap::new()),
         })
     }
@@ -516,32 +576,42 @@ impl GpuFft {
         }
     }
 
-    /// Execute the compute shader pass with performance optimizations.
+    /// Execute the compute shader pass.
     fn execute_compute_pass(&self, sc: &SizeCache, batch_size: u32, n: usize) {
-        // Use a single command encoder for the entire operation
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Optimized FFT Pass"),
+                label: Some("FFT Pass"),
             });
 
-        // Optimized compute pass with better resource utilization
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("FFT Compute"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
 
-            // Process all stages efficiently
-            for bg in &sc.stage_bgs {
-                pass.set_bind_group(0, bg, &[]);
-                // Optimized workgroup dispatch with batch dimension
-                pass.dispatch_workgroups(sc.wg_n2, batch_size, 1);
+            if sc.wg_r4 > 0 {
+                // R4 mode: ⌊log₄N⌋ Radix-4 dispatches + optional Radix-2
+                pass.set_pipeline(&self.pipeline);
+                for bg in &sc.stage_bgs {
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(sc.wg_r4, batch_size, 1);
+                }
+                if let Some(r2_bg) = &sc.stage_bg_r2 {
+                    pass.set_pipeline(self.pipeline_r2.as_ref().unwrap());
+                    pass.set_bind_group(0, r2_bg, &[]);
+                    pass.dispatch_workgroups(sc.wg_n2, batch_size, 1);
+                }
+            } else {
+                // Legacy mode (with_shader): log₂N Radix-2 dispatches
+                pass.set_pipeline(&self.pipeline);
+                for bg in &sc.stage_bgs {
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(sc.wg_n2, batch_size, 1);
+                }
             }
         }
 
-        // Efficient result transfer
         let result_buf = if sc.result_in_b { &sc.buf_b } else { &sc.buf_a };
         let single_fft_bytes = (n * 2 * std::mem::size_of::<f32>()) as u64;
         enc.copy_buffer_to_buffer(
@@ -552,7 +622,6 @@ impl GpuFft {
             single_fft_bytes * batch_size as u64,
         );
 
-        // Submit with minimal overhead
         self.queue.submit(std::iter::once(enc.finish()));
     }
 
@@ -649,6 +718,17 @@ impl GpuFft {
 
     /// Build GPU buffers and bind groups for a specific FFT size.
     fn build_size_cache(&self, n: usize, log_n: u32) -> SizeCache {
+        let is_r4_mode = self.pipeline_r2.is_some();
+
+        // Stage counts
+        let num_r4 = if is_r4_mode { (log_n / 2) as usize } else { 0 };
+        let has_r2 = is_r4_mode && log_n % 2 == 1;
+        let total_stages = if is_r4_mode {
+            num_r4 + has_r2 as usize
+        } else {
+            log_n as usize
+        };
+
         let single_fft_bytes = (n * 2 * std::mem::size_of::<f32>()) as u64;
         let max_batch_size = (self.device.limits().max_storage_buffer_binding_size as u64
             / single_fft_bytes)
@@ -675,40 +755,15 @@ impl GpuFft {
             mapped_at_creation: false,
         });
 
-        // Uniform buffer: one slot per stage, stride-aligned.
-        let alignment = self.device.limits().min_uniform_buffer_offset_alignment as u64;
-        let entry_bytes = std::mem::size_of::<FftUniforms>() as u64;
-        let stride = entry_bytes.div_ceil(alignment) * alignment;
-
-        let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("fft_uniforms"),
-            size: stride * log_n as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Write uniforms for each stage
-        for stage in 0..log_n {
-            self.queue.write_buffer(
-                &uniform_buf,
-                stride * stage as u64,
-                bytemuck::bytes_of(&FftUniforms {
-                    n: n as u32,
-                    stage,
-                    log_n,
-                    _pad: 0,
-                }),
-            );
-        }
-
-        // Precompute twiddle factors: N/2 complex pairs e^{-2πij/N}.
-        let twiddles: Vec<f32> = (0..n / 2)
+        // Twiddle table: N entries for R4 mode (max accessed index = 3N/2−5 < 2N),
+        // N/2 entries for legacy R2 mode (max accessed index = N−2 < N).
+        let twiddle_count = if is_r4_mode { n } else { n / 2 };
+        let twiddles: Vec<f32> = (0..twiddle_count)
             .flat_map(|j| {
                 let angle = -std::f32::consts::TAU * j as f32 / n as f32;
                 [angle.cos(), angle.sin()]
             })
             .collect();
-
         let twiddle_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fft_twiddles"),
             size: (twiddles.len() * std::mem::size_of::<f32>()) as u64,
@@ -718,14 +773,31 @@ impl GpuFft {
         self.queue
             .write_buffer(&twiddle_buf, 0, bytemuck::cast_slice(&twiddles));
 
-        // Pre-bake bind groups: even stages read A / write B, odd stages read B / write A.
-        let uniform_size = NonZeroU64::new(entry_bytes);
-        let layout = self.pipeline.get_bind_group_layout(0);
+        let alignment = self.device.limits().min_uniform_buffer_offset_alignment as u64;
+        let entry_bytes = std::mem::size_of::<FftUniforms>() as u64;
+        let stride = entry_bytes.div_ceil(alignment) * alignment;
 
-        let make_bg = |src: &wgpu::Buffer, dst: &wgpu::Buffer, uniform_offset: u64| {
+        let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fft_uniforms"),
+            size: stride * total_stages.max(1) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let uniform_size = NonZeroU64::new(entry_bytes);
+        let layout_r4 = self.pipeline.get_bind_group_layout(0);
+        let layout_r2_opt = self
+            .pipeline_r2
+            .as_ref()
+            .map(|p| p.get_bind_group_layout(0));
+
+        let make_bg_with_layout = |layout: &wgpu::BindGroupLayout,
+                                   src: &wgpu::Buffer,
+                                   dst: &wgpu::Buffer,
+                                   uniform_offset: u64| {
             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
-                layout: &layout,
+                layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -751,26 +823,118 @@ impl GpuFft {
             })
         };
 
-        let stage_bgs = (0..log_n as usize)
-            .map(|s| {
-                let (src, dst) = if s % 2 == 0 {
+        let make_bg = |src: &wgpu::Buffer, dst: &wgpu::Buffer, uniform_offset: u64| {
+            make_bg_with_layout(&layout_r4, src, dst, uniform_offset)
+        };
+
+        if is_r4_mode {
+            // ── R4 mode: ⌊log₄N⌋ Radix-4 stages + optional Radix-2 ─────────────
+            // U.y = p (stride = 4^s) written directly — not a stage index.
+            for s in 0..num_r4 {
+                let p = 1u32 << (s as u32 * 2);
+                self.queue.write_buffer(
+                    &uniform_buf,
+                    stride * s as u64,
+                    bytemuck::bytes_of(&FftUniforms {
+                        n: n as u32,
+                        stage: p, // 'stage' field carries p directly
+                        log_n,
+                        _pad: 0,
+                    }),
+                );
+            }
+            if has_r2 {
+                let p = 1u32 << (num_r4 as u32 * 2);
+                self.queue.write_buffer(
+                    &uniform_buf,
+                    stride * num_r4 as u64,
+                    bytemuck::bytes_of(&FftUniforms {
+                        n: n as u32,
+                        stage: p,
+                        log_n,
+                        _pad: 0,
+                    }),
+                );
+            }
+
+            let stage_bgs: Vec<wgpu::BindGroup> = (0..num_r4)
+                .map(|s| {
+                    let (src, dst) = if s % 2 == 0 {
+                        (&buf_a, &buf_b)
+                    } else {
+                        (&buf_b, &buf_a)
+                    };
+                    make_bg(src, dst, stride * s as u64)
+                })
+                .collect();
+
+            let stage_bg_r2 = if has_r2 {
+                let (src, dst) = if num_r4 % 2 == 0 {
                     (&buf_a, &buf_b)
                 } else {
                     (&buf_b, &buf_a)
                 };
-                make_bg(src, dst, stride * s as u64)
-            })
-            .collect();
+                let layout_r2 = layout_r2_opt.as_ref().unwrap();
+                Some(make_bg_with_layout(
+                    layout_r2,
+                    src,
+                    dst,
+                    stride * num_r4 as u64,
+                ))
+            } else {
+                None
+            };
 
-        SizeCache {
-            buf_a,
-            buf_b,
-            staging_buf,
-            twiddle_buf,
-            data_bytes,
-            stage_bgs,
-            result_in_b: log_n % 2 == 1,
-            wg_n2: (n as u32 / 2).div_ceil(256),
+            SizeCache {
+                buf_a,
+                buf_b,
+                staging_buf,
+                twiddle_buf,
+                data_bytes,
+                stage_bgs,
+                stage_bg_r2,
+                result_in_b: total_stages % 2 == 1,
+                wg_n2: (n as u32 / 2).div_ceil(256),
+                wg_r4: (n as u32 / 4).div_ceil(256),
+            }
+        } else {
+            // ── Legacy mode (with_shader): log₂N Radix-2 stages, stage-index uniforms ──
+            for stage in 0..log_n {
+                self.queue.write_buffer(
+                    &uniform_buf,
+                    stride * stage as u64,
+                    bytemuck::bytes_of(&FftUniforms {
+                        n: n as u32,
+                        stage,
+                        log_n,
+                        _pad: 0,
+                    }),
+                );
+            }
+
+            let stage_bgs = (0..log_n as usize)
+                .map(|s| {
+                    let (src, dst) = if s % 2 == 0 {
+                        (&buf_a, &buf_b)
+                    } else {
+                        (&buf_b, &buf_a)
+                    };
+                    make_bg(src, dst, stride * s as u64)
+                })
+                .collect();
+
+            SizeCache {
+                buf_a,
+                buf_b,
+                staging_buf,
+                twiddle_buf,
+                data_bytes,
+                stage_bgs,
+                stage_bg_r2: None,
+                result_in_b: log_n % 2 == 1,
+                wg_n2: (n as u32 / 2).div_ceil(256),
+                wg_r4: 0,
+            }
         }
     }
 }

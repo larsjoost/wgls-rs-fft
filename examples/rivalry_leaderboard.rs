@@ -123,8 +123,7 @@ fn main() {
         for rival in &rivals {
             match benchmark_gpu_pipeline(rival.as_ref(), n, batch_size) {
                 Ok(gpu_result) => {
-                    let validation =
-                        validate_rival(rival.as_ref(), &reference, n, batch_size);
+                    let validation = validate_rival(rival.as_ref(), &reference, n, batch_size);
                     let status = match &validation {
                         ValidationOutcome::Pass => "PASS".to_string(),
                         ValidationOutcome::Fail { max_error } => {
@@ -175,4 +174,65 @@ fn choose_batch_size(n: usize) -> usize {
         batch /= 2;
     }
     batch.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_complex::Complex;
+
+    // ── choose_batch_size (pure logic) ────────────────────────────────────────
+
+    #[test]
+    fn batch_size_small_n() {
+        assert_eq!(choose_batch_size(256), 1024);
+        assert_eq!(choose_batch_size(1024), 1024);
+    }
+
+    #[test]
+    fn batch_size_medium_n() {
+        assert_eq!(choose_batch_size(16384), 256);
+        assert_eq!(choose_batch_size(65536), 64);
+    }
+
+    #[test]
+    fn batch_size_large_n() {
+        assert_eq!(choose_batch_size(262_144), 16);
+        assert_eq!(choose_batch_size(1_048_576), 1);
+    }
+
+    #[test]
+    fn batch_size_never_exceeds_cap() {
+        for &n in &[256usize, 1024, 16384, 65536, 262_144, 1_048_576] {
+            let b = choose_batch_size(n);
+            assert!(
+                n * b <= MAX_TOTAL_SAMPLES,
+                "n={n} batch={b} exceeds MAX_TOTAL_SAMPLES"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_size_always_at_least_one() {
+        for n in [1usize, 2, 256, 1024, 16384, 65536, 1_048_576] {
+            assert!(choose_batch_size(n) >= 1, "n={n} gave batch_size 0");
+        }
+    }
+
+    // ── GPU correctness ───────────────────────────────────────────────────────
+
+    #[test]
+    fn fft_roundtrip_n256() {
+        let fft = GpuFft::new().expect("GPU required");
+        let n = 256usize;
+        let input: Vec<Vec<Complex<f32>>> = vec![(0..n)
+            .map(|i| Complex::new((i as f32).sin() * 0.001, 0.0))
+            .collect()];
+        let spectrum = fft.fft(&input).expect("fft failed");
+        let recon = fft.ifft(&spectrum).expect("ifft failed");
+        for (a, b) in input[0].iter().zip(recon[0].iter()) {
+            let err = (a - b).norm();
+            assert!(err < 1e-3, "roundtrip error {err:.2e} at N=256");
+        }
+    }
 }
