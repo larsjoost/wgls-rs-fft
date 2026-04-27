@@ -945,6 +945,8 @@ impl Default for GpuFft {
     }
 }
 
+pub use shaders::{R2_WGSL, R4_WGSL};
+
 #[cfg(feature = "cuda")]
 pub use cufft_wrapper::CuFft;
 #[cfg(feature = "hipfft")]
