@@ -46,7 +46,7 @@ impl CuFft {
 
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
-        let plan = CudaFft::plan_1d(
+        let single_plan = CudaFft::plan_1d(
             fft_size as i32,
             sys::cufftType::CUFFT_C2C,
             1,
@@ -54,7 +54,7 @@ impl CuFft {
         )?;
 
         Ok(Self {
-            plan,
+            plan: single_plan,
             stream,
             fft_size,
         })
@@ -116,6 +116,21 @@ impl CuFft {
         values.iter().map(|c| Complex::new(c.x, c.y)).collect()
     }
 
+    /// Convert from Complex<f32> vectors to flattened sys::float2 format
+    pub fn to_flattened_input(inputs: &[Vec<Complex<f32>>]) -> Vec<sys::float2> {
+        inputs
+            .iter()
+            .flat_map(|v| v.iter().map(|c| sys::float2 { x: c.re, y: c.im }))
+            .collect()
+    }
+
+    /// Convert from flattened sys::float2 format to Complex<f32> vectors
+    pub fn from_flattened_output(flat_output: Vec<sys::float2>, n: usize) -> Vec<Vec<Complex<f32>>> {
+        flat_output.chunks(n).map(|chunk| {
+            chunk.iter().map(|c| Complex::new(c.x, c.y)).collect()
+        }).collect()
+    }
+
     fn scale_inverse(output: &mut [Complex<f32>], n: usize) {
         let scale = 1.0 / n as f32;
         for c in output {
@@ -156,6 +171,30 @@ impl CuFft {
         Ok(result)
     }
 
+
+
+    /// Perform batch FFT on pre-flattened input (optimized for benchmarking).
+    /// Input: flattened vector of complex pairs [re0, im0, re1, im1, ...]
+    /// Output: flattened vector of complex pairs
+    pub fn batch_fft_flattened(
+        &self,
+        flat_input: &[sys::float2],
+        n: usize,
+        batch_size: usize,
+    ) -> Result<Vec<sys::float2>, Box<dyn Error>> {
+        if flat_input.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut d_input = self.stream.clone_htod(flat_input)?;
+        let mut d_output = self.stream.alloc_zeros::<sys::float2>(n * batch_size)?;
+
+        self.plan.exec_c2c(&mut d_input, &mut d_output, FftDirection::Forward)?;
+
+        let flat_output: Vec<sys::float2> = self.stream.clone_dtoh(&d_output)?;
+        Ok(flat_output)
+    }
+
     /// Perform batch FFT.
     pub fn batch_fft(
         &self,
@@ -173,21 +212,40 @@ impl CuFft {
             .flat_map(|v| v.iter().map(|c| sys::float2 { x: c.re, y: c.im }))
             .collect();
 
-        let mut d_input = self.stream.clone_htod(&flat_input)?;
-        let mut d_output = self.stream.alloc_zeros::<sys::float2>(n * batch_size)?;
-
-        let plan = CudaFft::plan_1d(
-            n as i32,
-            sys::cufftType::CUFFT_C2C,
-            batch_size as i32,
-            self.stream.clone(),
-        )?;
-        plan.exec_c2c(&mut d_input, &mut d_output, FftDirection::Forward)?;
-
-        let flat_output: Vec<sys::float2> = self.stream.clone_dtoh(&d_output)?;
+        let flat_output = self.batch_fft_flattened(&flat_input, n, batch_size)?;
         let result = flat_output.chunks(n).map(Self::from_cuda_complex).collect();
 
         Ok(result)
+    }
+
+    /// Perform batch IFFT on pre-flattened input (optimized for benchmarking).
+    /// Input: flattened vector of complex pairs [re0, im0, re1, im1, ...]
+    /// Output: flattened vector of complex pairs (scaled by 1/N)
+    pub fn batch_ifft_flattened(
+        &self,
+        flat_input: &[sys::float2],
+        n: usize,
+        batch_size: usize,
+    ) -> Result<Vec<sys::float2>, Box<dyn Error>> {
+        if flat_input.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut d_input = self.stream.clone_htod(flat_input)?;
+        let mut d_output = self.stream.alloc_zeros::<sys::float2>(n * batch_size)?;
+
+        self.plan.exec_c2c(&mut d_input, &mut d_output, FftDirection::Inverse)?;
+
+        let mut flat_output: Vec<sys::float2> = self.stream.clone_dtoh(&d_output)?;
+        
+        // Apply scaling for inverse transform
+        let scale = 1.0 / n as f32;
+        for c in &mut flat_output {
+            c.x *= scale;
+            c.y *= scale;
+        }
+
+        Ok(flat_output)
     }
 
     fn batch_ifft(
@@ -206,25 +264,9 @@ impl CuFft {
             .flat_map(|v| v.iter().map(|c| sys::float2 { x: c.re, y: c.im }))
             .collect();
 
-        let mut d_input = self.stream.clone_htod(&flat_input)?;
-        let mut d_output = self.stream.alloc_zeros::<sys::float2>(n * batch_size)?;
-
-        let plan = CudaFft::plan_1d(
-            n as i32,
-            sys::cufftType::CUFFT_C2C,
-            batch_size as i32,
-            self.stream.clone(),
-        )?;
-        plan.exec_c2c(&mut d_input, &mut d_output, FftDirection::Inverse)?;
-
-        let flat_output: Vec<sys::float2> = self.stream.clone_dtoh(&d_output)?;
-
+        let flat_output = self.batch_ifft_flattened(&flat_input, n, batch_size)?;
         let mut result: Vec<Vec<Complex<f32>>> =
             flat_output.chunks(n).map(Self::from_cuda_complex).collect();
-
-        for values in &mut result {
-            Self::scale_inverse(values, n);
-        }
 
         Ok(result)
     }

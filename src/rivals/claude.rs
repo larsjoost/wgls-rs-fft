@@ -8,14 +8,6 @@ use wgsl_rs::wgsl;
 use crate::FftExecutor;
 
 // ── WGSL: Stockham Radix-8 DIT ───────────────────────────────────────────────
-//
-// Each thread handles one 8-point butterfly (reads N/8 elements of the signal).
-// Stage s: p = 8^s, stride = (N/8) / p
-//
-// Split into even/odd 4-point DFTs, combine with W_8^k constants:
-//   W_8^0=1, W_8^1=(1-i)/√2, W_8^2=-i, W_8^3=-(1+i)/√2
-//
-// Output Stockham positions: o_m = j*8p + k + m*p  (m=0..7)
 const CLAUDE_R8_WGSL: &str = r#"
 @group(0) @binding(0) var<uniform> U: vec4<u32>;
 @group(0) @binding(1) var<storage, read_write> SRC: array<f32>;
@@ -27,17 +19,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tid      = gid.x;
     let batch_id = gid.y;
     let n        = U.x;
-    let e        = n >> 3u;   // eighth_n = N/8
+    let e        = n >> 3u;
     if tid >= e { return; }
 
     let stage  = U.y;
-    let p      = 1u << (stage * 3u);   // 8^stage
+    let p      = 1u << (stage * 3u);
     let eight_p = p << 3u;
 
     let k = tid % p;
     let j = tid / p;
 
-    let bo = batch_id * n * 2u;   // batch offset in floats
+    let bo = batch_id * n * 2u;
 
     let i0 = j*p + k;
     let i1 = i0 + e;      let i2 = i0 + 2u*e;  let i3 = i0 + 3u*e;
@@ -55,12 +47,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x6r = SRC[s6]; let x6i = SRC[s6+1u];
     let x7r = SRC[s7]; let x7i = SRC[s7+1u];
 
-    // External twiddles from pre-computed table (tw_m = m * k * stride)
     let stride = e >> (stage * 3u);
     let tw1 = k*stride; let tw2 = 2u*tw1; let tw3 = 3u*tw1;
     let tw4 = 4u*tw1;   let tw5 = 5u*tw1; let tw6 = 6u*tw1; let tw7 = 7u*tw1;
 
-    // b0 = x0 (W^0 = 1), bm = W_N^twm * xm
     let b0r = x0r; let b0i = x0i;
 
     let wr1 = TWIDDLE[2u*tw1]; let wi1 = TWIDDLE[2u*tw1+1u];
@@ -84,19 +74,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let wr7 = TWIDDLE[2u*tw7]; let wi7 = TWIDDLE[2u*tw7+1u];
     let b7r = wr7*x7r - wi7*x7i; let b7i = wr7*x7i + wi7*x7r;
 
-    // 4-point DFT of even group [b0, b2, b4, b6]
     let s04r = b0r+b4r; let s04i = b0i+b4i;
     let d04r = b0r-b4r; let d04i = b0i-b4i;
     let s26r = b2r+b6r; let s26i = b2i+b6i;
     let d26r = b2r-b6r; let d26i = b2i-b6i;
 
-    // E[0]=s04+s26, E[2]=s04-s26, E[1]=d04+(-i)*d26, E[3]=d04+i*d26
     let e0r = s04r+s26r; let e0i = s04i+s26i;
     let e2r = s04r-s26r; let e2i = s04i-s26i;
     let e1r = d04r+d26i; let e1i = d04i-d26r;
     let e3r = d04r-d26i; let e3i = d04i+d26r;
 
-    // 4-point DFT of odd group [b1, b3, b5, b7]
     let s15r = b1r+b5r; let s15i = b1i+b5i;
     let d15r = b1r-b5r; let d15i = b1i-b5i;
     let s37r = b3r+b7r; let s37i = b3i+b7i;
@@ -107,18 +94,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let o1r = d15r+d37i; let o1i = d15i-d37r;
     let o3r = d15r-d37i; let o3i = d15i+d37r;
 
-    // Combine with internal W_8^k constants (1/sqrt(2) = 0.70710678...)
-    // W_8^0=1, W_8^1=(1-i)/√2, W_8^2=-i, W_8^3=-(1+i)/√2
     let s = 0.70710678118654752;
 
-    // W_8^1 * o1: re=(o1r+o1i)*s, im=(o1i-o1r)*s
     let w1o1r = (o1r+o1i)*s; let w1o1i = (o1i-o1r)*s;
-    // W_8^2 * o2 = -i*o2: (o2i, -o2r)
     let w2o2r = o2i;  let w2o2i = -o2r;
-    // W_8^3 * o3 = -(1+i)/√2 * o3: re=(-o3r+o3i)*s, im=-(o3r+o3i)*s
     let w3o3r = (-o3r+o3i)*s; let w3o3i = -(o3r+o3i)*s;
 
-    // Y[k] = E[k] + W_8^k * O[k],  Y[k+4] = E[k] - W_8^k * O[k]
     let y0r = e0r+o0r;    let y0i = e0i+o0i;
     let y1r = e1r+w1o1r;  let y1i = e1i+w1o1i;
     let y2r = e2r+w2o2r;  let y2i = e2i+w2o2i;
@@ -128,7 +109,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let y6r = e2r-w2o2r;  let y6i = e2i-w2o2i;
     let y7r = e3r-w3o3r;  let y7i = e3i-w3o3i;
 
-    // Stockham output: o_m = j*eight_p + k + m*p
     let d0 = bo + 2u*(j*eight_p + k);
     let d1 = d0 + 2u*p; let d2 = d0 + 4u*p; let d3 = d0 + 6u*p;
     let d4 = d0 + 8u*p; let d5 = d0 + 10u*p; let d6 = d0 + 12u*p; let d7 = d0 + 14u*p;
@@ -294,6 +274,199 @@ pub mod claude_r2_kernel {
     }
 }
 
+// ── WGSL: Workgroup-local Stockham R8/4/2 (N ≤ 1024) ────────────────────────
+//
+// Single dispatch per batch: each workgroup processes one signal entirely in
+// shared memory, eliminating all global-memory round-trips between stages.
+// Uses R8 stages (log_n/3) then an optional R4 (rem==2) or R2 (rem==1) stage.
+// Fewer barriers vs Gemini's local R4: N=256 → 3 vs 4, N=1024 → 4 vs 5.
+const CLAUDE_LOCAL_WGSL: &str = r#"
+@group(0) @binding(0) var<uniform> U: vec4<u32>;
+@group(0) @binding(1) var<storage, read_write> SRC: array<f32>;
+@group(0) @binding(2) var<storage, read_write> DST: array<f32>;
+@group(0) @binding(3) var<storage, read> TWIDDLE: array<f32>;
+
+var<workgroup> lds_a: array<vec2<f32>, 1024>;
+var<workgroup> lds_b: array<vec2<f32>, 1024>;
+
+fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x);
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let n     = U.x;
+    let log_n = U.z;
+    let batch = wid.x;
+    let tid   = lid.x;
+    let bo    = batch * n * 2u;
+
+    // Load signal from global memory into lds_a
+    for (var i = tid; i < n; i += 256u) {
+        lds_a[i] = vec2<f32>(SRC[bo + i*2u], SRC[bo + i*2u + 1u]);
+    }
+    workgroupBarrier();
+
+    let num_r8 = log_n / 3u;
+    let rem    = log_n % 3u;
+    var pp = true;   // true = read lds_a, write lds_b
+
+    // Radix-8 stages in shared memory
+    for (var s = 0u; s < num_r8; s++) {
+        let p        = 1u << (s * 3u);
+        let eight_p  = p << 3u;
+        let eighth_n = n >> 3u;
+        let stride   = eighth_n / p;
+
+        for (var i = tid; i < eighth_n; i += 256u) {
+            let k    = i % p;
+            let j    = i / p;
+            let base = j*p + k;
+
+            var x: array<vec2<f32>, 8>;
+            if (pp) {
+                x[0]=lds_a[base];              x[1]=lds_a[base+  eighth_n];
+                x[2]=lds_a[base+2u*eighth_n];  x[3]=lds_a[base+3u*eighth_n];
+                x[4]=lds_a[base+4u*eighth_n];  x[5]=lds_a[base+5u*eighth_n];
+                x[6]=lds_a[base+6u*eighth_n];  x[7]=lds_a[base+7u*eighth_n];
+            } else {
+                x[0]=lds_b[base];              x[1]=lds_b[base+  eighth_n];
+                x[2]=lds_b[base+2u*eighth_n];  x[3]=lds_b[base+3u*eighth_n];
+                x[4]=lds_b[base+4u*eighth_n];  x[5]=lds_b[base+5u*eighth_n];
+                x[6]=lds_b[base+6u*eighth_n];  x[7]=lds_b[base+7u*eighth_n];
+            }
+
+            // External Stockham twiddles: W_N^{m*k*stride}
+            let tw = k * stride;
+            for (var m = 1u; m < 8u; m++) {
+                let ti = 2u * m * tw;
+                x[m] = cmul(vec2<f32>(TWIDDLE[ti], TWIDDLE[ti+1u]), x[m]);
+            }
+
+            // 8-point DFT
+            let s04 = x[0]+x[4]; let d04 = x[0]-x[4];
+            let s26 = x[2]+x[6]; let d26 = x[2]-x[6];
+            let e0  = s04+s26;
+            let e2  = s04-s26;
+            let e1  = vec2<f32>(d04.x+d26.y, d04.y-d26.x);
+            let e3  = vec2<f32>(d04.x-d26.y, d04.y+d26.x);
+
+            let s15 = x[1]+x[5]; let d15 = x[1]-x[5];
+            let s37 = x[3]+x[7]; let d37 = x[3]-x[7];
+            let o0  = s15+s37;
+            let o2  = s15-s37;
+            let o1  = vec2<f32>(d15.x+d37.y, d15.y-d37.x);
+            let o3  = vec2<f32>(d15.x-d37.y, d15.y+d37.x);
+
+            let sq   = 0.70710678118654752;
+            let w1o1 = vec2<f32>((o1.x+o1.y)*sq, (o1.y-o1.x)*sq);
+            let w2o2 = vec2<f32>(o2.y, -o2.x);
+            let w3o3 = vec2<f32>((-o3.x+o3.y)*sq, -(o3.x+o3.y)*sq);
+
+            var y: array<vec2<f32>, 8>;
+            y[0]=e0+o0;   y[4]=e0-o0;
+            y[1]=e1+w1o1; y[5]=e1-w1o1;
+            y[2]=e2+w2o2; y[6]=e2-w2o2;
+            y[3]=e3+w3o3; y[7]=e3-w3o3;
+
+            let db = j*eight_p + k;
+            if (pp) {
+                for (var m = 0u; m < 8u; m++) { lds_b[db + m*p] = y[m]; }
+            } else {
+                for (var m = 0u; m < 8u; m++) { lds_a[db + m*p] = y[m]; }
+            }
+        }
+        pp = !pp;
+        workgroupBarrier();
+    }
+
+    // Radix-4 remainder stage (rem == 2)
+    if (rem == 2u) {
+        let p         = 1u << (num_r8 * 3u);
+        let four_p    = p << 2u;
+        let quarter_n = n >> 2u;
+        let stride    = quarter_n / p;
+
+        for (var i = tid; i < quarter_n; i += 256u) {
+            let k    = i % p;
+            let j    = i / p;
+            let base = j*p + k;
+
+            var x: array<vec2<f32>, 4>;
+            if (pp) {
+                x[0]=lds_a[base]; x[1]=lds_a[base+quarter_n];
+                x[2]=lds_a[base+2u*quarter_n]; x[3]=lds_a[base+3u*quarter_n];
+            } else {
+                x[0]=lds_b[base]; x[1]=lds_b[base+quarter_n];
+                x[2]=lds_b[base+2u*quarter_n]; x[3]=lds_b[base+3u*quarter_n];
+            }
+
+            let tw = k * stride;
+            x[1] = cmul(vec2<f32>(TWIDDLE[2u*tw],   TWIDDLE[2u*tw+1u]), x[1]);
+            x[2] = cmul(vec2<f32>(TWIDDLE[4u*tw],   TWIDDLE[4u*tw+1u]), x[2]);
+            x[3] = cmul(vec2<f32>(TWIDDLE[6u*tw],   TWIDDLE[6u*tw+1u]), x[3]);
+
+            let s02 = x[0]+x[2]; let d02 = x[0]-x[2];
+            let s13 = x[1]+x[3]; let d13 = x[1]-x[3];
+
+            let db = j*four_p + k;
+            if (pp) {
+                lds_b[db]      = s02+s13;
+                lds_b[db+p]    = vec2<f32>(d02.x+d13.y, d02.y-d13.x);
+                lds_b[db+2u*p] = s02-s13;
+                lds_b[db+3u*p] = vec2<f32>(d02.x-d13.y, d02.y+d13.x);
+            } else {
+                lds_a[db]      = s02+s13;
+                lds_a[db+p]    = vec2<f32>(d02.x+d13.y, d02.y-d13.x);
+                lds_a[db+2u*p] = s02-s13;
+                lds_a[db+3u*p] = vec2<f32>(d02.x-d13.y, d02.y+d13.x);
+            }
+        }
+        pp = !pp;
+        workgroupBarrier();
+    }
+
+    // Radix-2 remainder stage (rem == 1)
+    if (rem == 1u) {
+        let p      = 1u << (num_r8 * 3u);
+        let two_p  = p + p;
+        let half_n = n >> 1u;
+        let stride = half_n / p;
+
+        for (var i = tid; i < half_n; i += 256u) {
+            let k  = i % p;
+            let j  = i / p;
+            let i1 = j*p + k;
+            let i2 = i1 + half_n;
+
+            var x1: vec2<f32>;
+            var x2: vec2<f32>;
+            if (pp) { x1=lds_a[i1]; x2=lds_a[i2]; } else { x1=lds_b[i1]; x2=lds_b[i2]; }
+
+            let tw = k * stride;
+            let t  = cmul(vec2<f32>(TWIDDLE[2u*tw], TWIDDLE[2u*tw+1u]), x2);
+            let db = j*two_p + k;
+
+            if (pp) { lds_b[db]=x1+t; lds_b[db+p]=x1-t; }
+            else    { lds_a[db]=x1+t; lds_a[db+p]=x1-t; }
+        }
+        pp = !pp;
+        workgroupBarrier();
+    }
+
+    // Write result back to global memory (DST = buf_b)
+    for (var i = tid; i < n; i += 256u) {
+        var val: vec2<f32>;
+        if (pp) { val = lds_a[i]; } else { val = lds_b[i]; }
+        DST[bo + i*2u]    = val.x;
+        DST[bo + i*2u+1u] = val.y;
+    }
+}
+"#;
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
@@ -310,6 +483,7 @@ struct ClaudeCache {
     staging_buf: wgpu::Buffer,
     #[allow(dead_code)]
     twiddle_buf: wgpu::Buffer,
+    // Global ping-pong path (N > 1024)
     stage_bgs_r8: Vec<wgpu::BindGroup>,
     stage_bg_r4: Option<wgpu::BindGroup>,
     stage_bg_r2: Option<wgpu::BindGroup>,
@@ -317,6 +491,9 @@ struct ClaudeCache {
     wg_n4: u32,
     wg_n2: u32,
     result_in_b: bool,
+    // Workgroup-local path (N ≤ 1024)
+    is_local: bool,
+    local_bg: Option<wgpu::BindGroup>,
 }
 
 pub struct ClaudeFft {
@@ -325,6 +502,7 @@ pub struct ClaudeFft {
     pipeline_r8: wgpu::ComputePipeline,
     pipeline_r4: wgpu::ComputePipeline,
     pipeline_r2: wgpu::ComputePipeline,
+    pipeline_local: wgpu::ComputePipeline,
     cache: RefCell<std::collections::HashMap<usize, ClaudeCache>>,
 }
 
@@ -374,6 +552,7 @@ impl ClaudeFft {
             &claude_r2_kernel::WGSL_MODULE.wgsl_source().join("\n"),
             "claude_r2",
         );
+        let pipeline_local = compile_wgsl(CLAUDE_LOCAL_WGSL, "claude_local");
 
         Self {
             device,
@@ -381,18 +560,22 @@ impl ClaudeFft {
             pipeline_r8,
             pipeline_r4,
             pipeline_r2,
+            pipeline_local,
             cache: RefCell::new(std::collections::HashMap::new()),
         }
     }
 
     fn build_cache(&self, n: usize, log_n: u32) -> ClaudeCache {
-        // Stage plan: as many radix-8 stages as possible, then radix-4 or radix-2 for remainder.
-        // log_n = 3*num_r8 + 2*num_r4 + num_r2
+        let is_local = n <= 1024;
         let num_r8 = (log_n / 3) as usize;
         let rem = log_n % 3;
         let has_r4 = rem == 2;
         let has_r2 = rem == 1;
-        let total_stages = num_r8 + has_r4 as usize + has_r2 as usize;
+        let total_stages = if is_local {
+            1
+        } else {
+            num_r8 + has_r4 as usize + has_r2 as usize
+        };
 
         let single_bytes = (n * 2 * std::mem::size_of::<f32>()) as u64;
         let max_batch =
@@ -425,8 +608,6 @@ impl ClaudeFft {
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         );
 
-        // N-entry twiddle table: e^{-2πij/N} for j=0..N
-        // Max radix-8 twiddle index = 7*(N/8) < N, always in bounds.
         let twiddles: Vec<f32> = (0..n)
             .flat_map(|j| {
                 let angle = -std::f32::consts::TAU * j as f32 / n as f32;
@@ -452,53 +633,6 @@ impl ClaudeFft {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
-        // Write uniforms for each stage.
-        for s in 0..num_r8 {
-            self.queue.write_buffer(
-                &uniform_buf,
-                stride * s as u64,
-                bytemuck::bytes_of(&Uniforms {
-                    n: n as u32,
-                    stage: s as u32,
-                    log_n,
-                    _pad: 0,
-                }),
-            );
-        }
-        let mut slot = num_r8;
-        if has_r4 {
-            // p after num_r8 radix-8 stages = 8^num_r8 = 2^(3*num_r8).
-            // The radix-4 kernel computes p = 4^stage = 2^(2*stage).
-            // So we need stage = 3*num_r8/2 (always integer when rem=2 and sizes are power-of-2).
-            let r4_stage = (3 * num_r8 as u32) / 2;
-            self.queue.write_buffer(
-                &uniform_buf,
-                stride * slot as u64,
-                bytemuck::bytes_of(&Uniforms {
-                    n: n as u32,
-                    stage: r4_stage,
-                    log_n,
-                    _pad: 0,
-                }),
-            );
-            slot += 1;
-        }
-        if has_r2 {
-            // p after num_r8 radix-8 stages = 8^num_r8 = 2^(3*num_r8).
-            // The radix-2 kernel computes p = 2^stage, so stage = 3*num_r8.
-            let r2_stage = 3 * num_r8 as u32;
-            self.queue.write_buffer(
-                &uniform_buf,
-                stride * slot as u64,
-                bytemuck::bytes_of(&Uniforms {
-                    n: n as u32,
-                    stage: r2_stage,
-                    log_n,
-                    _pad: 0,
-                }),
-            );
-        }
 
         let uniform_size = NonZeroU64::new(entry_bytes);
         let make_bg = |pipeline: &wgpu::ComputePipeline,
@@ -533,7 +667,78 @@ impl ClaudeFft {
             })
         };
 
-        // Build bind groups: even slot → buf_a→buf_b, odd slot → buf_b→buf_a.
+        // ── Local path (N ≤ 1024) ────────────────────────────────────────────
+        if is_local {
+            self.queue.write_buffer(
+                &uniform_buf,
+                0,
+                bytemuck::bytes_of(&Uniforms {
+                    n: n as u32,
+                    stage: 0,
+                    log_n,
+                    _pad: 0,
+                }),
+            );
+            let local_bg = make_bg(&self.pipeline_local, &buf_a, &buf_b, 0);
+            return ClaudeCache {
+                buf_a,
+                buf_b,
+                staging_buf,
+                twiddle_buf,
+                stage_bgs_r8: vec![],
+                stage_bg_r4: None,
+                stage_bg_r2: None,
+                wg_n8: 0,
+                wg_n4: 0,
+                wg_n2: 0,
+                result_in_b: true,
+                is_local: true,
+                local_bg: Some(local_bg),
+            };
+        }
+
+        // ── Global ping-pong path (N > 1024) ─────────────────────────────────
+        for s in 0..num_r8 {
+            self.queue.write_buffer(
+                &uniform_buf,
+                stride * s as u64,
+                bytemuck::bytes_of(&Uniforms {
+                    n: n as u32,
+                    stage: s as u32,
+                    log_n,
+                    _pad: 0,
+                }),
+            );
+        }
+        let mut slot = num_r8;
+        if has_r4 {
+            let r4_stage = (3 * num_r8 as u32) / 2;
+            self.queue.write_buffer(
+                &uniform_buf,
+                stride * slot as u64,
+                bytemuck::bytes_of(&Uniforms {
+                    n: n as u32,
+                    stage: r4_stage,
+                    log_n,
+                    _pad: 0,
+                }),
+            );
+            slot += 1;
+        }
+        if has_r2 {
+            let r2_stage = 3 * num_r8 as u32;
+            self.queue.write_buffer(
+                &uniform_buf,
+                stride * slot as u64,
+                bytemuck::bytes_of(&Uniforms {
+                    n: n as u32,
+                    stage: r2_stage,
+                    log_n,
+                    _pad: 0,
+                }),
+            );
+        }
+
         let stage_bgs_r8: Vec<wgpu::BindGroup> = (0..num_r8)
             .map(|s| {
                 let (src, dst) = if s % 2 == 0 {
@@ -588,6 +793,8 @@ impl ClaudeFft {
             wg_n4: (n as u32 / 4).div_ceil(256),
             wg_n2: (n as u32 / 2).div_ceil(256),
             result_in_b: total_stages % 2 == 1,
+            is_local: false,
+            local_bg: None,
         }
     }
 
@@ -638,20 +845,29 @@ impl ClaudeFft {
                 label: Some("claude_fft_compute"),
                 timestamp_writes: None,
             });
-            for bg in &cache.stage_bgs_r8 {
-                pass.set_pipeline(&self.pipeline_r8);
-                pass.set_bind_group(0, bg, &[]);
-                pass.dispatch_workgroups(cache.wg_n8, batch_size, 1);
-            }
-            if let Some(bg) = &cache.stage_bg_r4 {
-                pass.set_pipeline(&self.pipeline_r4);
-                pass.set_bind_group(0, bg, &[]);
-                pass.dispatch_workgroups(cache.wg_n4, batch_size, 1);
-            }
-            if let Some(bg) = &cache.stage_bg_r2 {
-                pass.set_pipeline(&self.pipeline_r2);
-                pass.set_bind_group(0, bg, &[]);
-                pass.dispatch_workgroups(cache.wg_n2, batch_size, 1);
+
+            if cache.is_local {
+                // Single dispatch: entire FFT in shared memory, one workgroup per signal
+                pass.set_pipeline(&self.pipeline_local);
+                pass.set_bind_group(0, cache.local_bg.as_ref().unwrap(), &[]);
+                pass.dispatch_workgroups(batch_size, 1, 1);
+            } else {
+                // Multi-pass global ping-pong
+                for bg in &cache.stage_bgs_r8 {
+                    pass.set_pipeline(&self.pipeline_r8);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(cache.wg_n8, batch_size, 1);
+                }
+                if let Some(bg) = &cache.stage_bg_r4 {
+                    pass.set_pipeline(&self.pipeline_r4);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(cache.wg_n4, batch_size, 1);
+                }
+                if let Some(bg) = &cache.stage_bg_r2 {
+                    pass.set_pipeline(&self.pipeline_r2);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(cache.wg_n2, batch_size, 1);
+                }
             }
         }
 
@@ -696,7 +912,7 @@ impl ClaudeFft {
 
 impl FftExecutor for ClaudeFft {
     fn name(&self) -> &str {
-        "Claude (Stockham Radix-8/4/2 Mixed)"
+        "Claude (R8/4/2 + Local N≤1024)"
     }
 
     fn fft(

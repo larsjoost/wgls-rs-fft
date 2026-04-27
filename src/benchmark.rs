@@ -148,6 +148,47 @@ pub fn benchmark_gpu_pipeline(
     })
 }
 
+/// Validate `rival` against `reference` for a single (n, batch_size) pair without timing.
+///
+/// Runs one forward FFT on each and compares every output sample.
+/// Use this when performance is already measured separately.
+pub fn validate_rival(
+    rival: &dyn FftExecutor,
+    reference: &dyn FftExecutor,
+    n: usize,
+    batch_size: usize,
+) -> ValidationOutcome {
+    let inputs: Vec<Vec<Complex<f32>>> = (0..batch_size)
+        .map(|_| {
+            let n_f = n as f32;
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / n_f;
+                    Complex::new(t * 0.001, (t * std::f32::consts::TAU).sin() * 0.001)
+                })
+                .collect()
+        })
+        .collect();
+
+    let rival_out = match rival.fft(&inputs) {
+        Ok(out) => out,
+        Err(_) => {
+            return ValidationOutcome::Fail {
+                max_error: f32::INFINITY,
+            }
+        }
+    };
+    let ref_out = match reference.fft(&inputs) {
+        Ok(out) => out,
+        Err(_) => {
+            return ValidationOutcome::Fail {
+                max_error: f32::INFINITY,
+            }
+        }
+    };
+    validate(&rival_out, &ref_out)
+}
+
 /// Benchmark `rival` at a fixed `n` and `batch_size`, validating against `reference`.
 ///
 /// Uses a deterministic input so every rival sees the same signal.
