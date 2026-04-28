@@ -67,6 +67,11 @@ pub trait GpuFftTrait {
     fn queue(&self) -> &wgpu::Queue;
 }
 
+/// GPU-accelerated FFT engine backed by wgpu compute shaders.
+///
+/// Implements the Stockham autosort Radix-4 algorithm with an optional Radix-2
+/// final stage for odd log₂N sizes. Use [`GpuFft::new`] for the default R4
+/// pipeline or [`GpuFft::with_shader`] to supply a custom WGSL kernel.
 pub struct GpuFft {
     device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -499,10 +504,9 @@ impl GpuFft {
 
     /// Validate that the input size is a power of two and non-zero.
     fn validate_input_size(&self, n: usize) -> Result<(), Box<dyn std::error::Error>> {
-        assert!(
-            n.is_power_of_two() && n > 0,
-            "Transform length must be a non-zero power of two"
-        );
+        if !n.is_power_of_two() || n == 0 {
+            return Err("Transform length must be a non-zero power of two".into());
+        }
         Ok(())
     }
 
@@ -522,11 +526,9 @@ impl GpuFft {
         // Validate all inputs have the same size
         let n = inputs[0].len();
         for input in inputs.iter() {
-            assert_eq!(
-                input.len(),
-                n,
-                "All input vectors in a batch must have the same length"
-            );
+            if input.len() != n {
+                return Err("All input vectors in a batch must have the same length".into());
+            }
             self.validate_input_size(input.len())?;
         }
 
@@ -730,6 +732,7 @@ impl GpuFft {
         };
 
         let single_fft_bytes = (n * 2 * std::mem::size_of::<f32>()) as u64;
+        // Cap at 1024 to avoid excessive pre-allocation; hardware limits are often much larger.
         let max_batch_size = (self.device.limits().max_storage_buffer_binding_size as u64
             / single_fft_bytes)
             .min(1024) as u32;
@@ -894,6 +897,7 @@ impl GpuFft {
                 stage_bgs,
                 stage_bg_r2,
                 result_in_b: total_stages % 2 == 1,
+                // 256 matches @workgroup_size(256,1,1) in the WGSL kernels.
                 wg_n2: (n as u32 / 2).div_ceil(256),
                 wg_r4: (n as u32 / 4).div_ceil(256),
             }

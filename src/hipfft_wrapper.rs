@@ -90,6 +90,7 @@ impl HipFft {
 
         // Probe by creating and immediately destroying a tiny plan.
         let mut probe: hipfftHandle = 0;
+        // SAFETY: /dev/kfd presence verified above; hipFFT C API requires raw pointers with no safe wrapper.
         unsafe {
             check(hipfftCreate(&mut probe))?;
             check(hipfftPlan1d(&mut probe, 1, HIPFFT_C2C, 1))?;
@@ -117,6 +118,8 @@ impl HipFft {
 
         let byte_count = host_in.len() * std::mem::size_of::<hipfftComplex>();
 
+        // SAFETY: hipFFT C API requires raw pointers; host_in is valid for byte_count bytes and
+        // outlives the GPU copy. All allocations are freed before returning.
         unsafe {
             let mut d_in: *mut std::ffi::c_void = std::ptr::null_mut();
             let mut d_out: *mut std::ffi::c_void = std::ptr::null_mut();
